@@ -33,6 +33,12 @@ type Resws struct {
 	// Pong timeout
 	PongTimeout time.Duration
 
+	// Read deadline
+	ReadDeadline time.Duration
+
+	// Write deadline
+	WriteDeadline time.Duration
+
 	// Message queue size
 	MessageQueueSize int
 
@@ -140,6 +146,12 @@ func (r *Resws) setDefaultConfig() {
 	}
 	if r.PongTimeout == 0 {
 		r.PongTimeout = 20 * time.Second
+	}
+	if r.ReadDeadline == 0 {
+		r.ReadDeadline = 15 * time.Second
+	}
+	if r.WriteDeadline == 0 {
+		r.WriteDeadline = 15 * time.Second
 	}
 	if r.MessageQueueSize == 0 {
 		r.MessageQueueSize = 10
@@ -416,6 +428,9 @@ func (r *Resws) Send(msg []byte) error {
 
 	// If we have a connection, try to send directly
 	if conn != nil {
+		if r.WriteDeadline > 0 {
+			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
+		}
 		err := conn.WriteMessage(websocket.TextMessage, msg)
 		if err == nil {
 			return nil
@@ -471,6 +486,9 @@ func (r *Resws) processMessageQueue() {
 			r.messageQueueMu.Unlock()
 
 			// Try to send the message
+			if r.WriteDeadline > 0 {
+				conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
+			}
 			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 				r.Logger.Error("Failed to send queued message: %v", err)
 				// If we failed to send, try to requeue the message
@@ -498,6 +516,9 @@ func (r *Resws) reader(conn *websocket.Conn) {
 		default:
 			if conn == nil {
 				return
+			}
+			if r.ReadDeadline > 0 {
+				conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
 			}
 			msgType, msg, err := conn.ReadMessage()
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
