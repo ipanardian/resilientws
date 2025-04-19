@@ -1,6 +1,31 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2025 ipanardian, <github.com/ipanardian>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, Subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or Substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 package resilientws
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -33,6 +58,12 @@ type Resws struct {
 	// Pong timeout
 	PongTimeout time.Duration
 
+	// Read deadline
+	ReadDeadline time.Duration
+
+	// Write deadline
+	WriteDeadline time.Duration
+
 	// Message queue size
 	MessageQueueSize int
 
@@ -57,19 +88,24 @@ type Resws struct {
 	// Ping handler
 	PingHandler func()
 
-	url            string
-	dialer         *websocket.Dialer
-	httpResp       *http.Response
-	mu             sync.RWMutex
-	messageQueue   [][]byte
-	messageQueueMu sync.Mutex
-	eventHandlers  map[EventType][]func(Event)
-	isConnected    bool
-	lastConnect    time.Time
-	lastErr        error
-	connectedCh    chan struct{}
-	stopCh         chan struct{}
-	closeOnce      sync.Once
+	url             string
+	dialer          *websocket.Dialer
+	httpResp        *http.Response
+	mu              sync.RWMutex
+	messageQueue    [][]byte
+	messageQueueMu  sync.Mutex
+	eventHandlers   map[EventType][]func(Event)
+	isConnected     bool
+	lastConnect     time.Time
+	lastErr         error
+	shouldReconnect bool
+	connectedCh     chan struct{}
+	connOnce        *sync.Once
+
+	ctx        context.Context
+	cancel     context.CancelFunc
+	connCtx    context.Context
+	connCancel context.CancelFunc
 
 	onReconnectingFn func(time.Duration)
 	onConnectedFn    func(string)
@@ -121,10 +157,9 @@ var errNotConnected = errors.New("websocket: not connected")
 // setDefaultConfig sets the default configuration for the WebSocket client
 func (r *Resws) setDefaultConfig() {
 	r.eventHandlers = make(map[EventType][]func(Event))
-	r.stopCh = make(chan struct{})
 
 	if r.RecBackoffMin == 0 {
-		r.RecBackoffMin = 2 * time.Second
+		r.RecBackoffMin = 1 * time.Second
 	}
 	if r.RecBackoffMax == 0 {
 		r.RecBackoffMax = 30 * time.Second
@@ -141,8 +176,17 @@ func (r *Resws) setDefaultConfig() {
 	if r.PongTimeout == 0 {
 		r.PongTimeout = 20 * time.Second
 	}
+	if r.ReadDeadline == 0 {
+		r.ReadDeadline = 15 * time.Second
+	}
+	if r.WriteDeadline == 0 {
+		r.WriteDeadline = 15 * time.Second
+	}
 	if r.MessageQueueSize == 0 {
 		r.MessageQueueSize = 10
+	}
+	if !r.shouldReconnect {
+		r.shouldReconnect = true
 	}
 	r.dialer = &websocket.Dialer{
 		TLSClientConfig:  r.TLSConfig,
@@ -203,34 +247,47 @@ func (r *Resws) emitEvent(event Event) {
 
 // OnError sets the error handler
 func (r *Resws) OnError(fn func(err error)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	r.onErrorFn = fn
 }
 
 // OnConnected sets the connected handler
 func (r *Resws) OnConnected(fn func(url string)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	r.onConnectedFn = fn
 }
 
 // OnReconnecting sets the reconnection handler
 func (r *Resws) OnReconnecting(fn func(time.Duration)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	r.onReconnectingFn = fn
 }
 
-// SetIsConnected sets the connection state
-func (r *Resws) SetIsConnected(isConnected bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+// setIsConnected sets the connection state
+func (r *Resws) setIsConnected(isConnected bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	r.isConnected = isConnected
+}
+
+// signalConnected signals the connection state
+func (r *Resws) signalConnected() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.connOnce.Do(func() {
+		select {
+		case r.connectedCh <- struct{}{}:
+		default:
+		}
+	})
 }
 
 // IsConnected returns the connection state
@@ -267,6 +324,8 @@ func (r *Resws) GetHTTPResponse() *http.Response {
 
 // Close closes the connection
 func (r *Resws) Close() {
+	r.cancel()
+
 	r.mu.Lock()
 	if r.Conn == nil {
 		r.mu.Unlock()
@@ -275,14 +334,14 @@ func (r *Resws) Close() {
 
 	r.Conn.Close()
 	r.Conn = nil
+	r.shouldReconnect = false
+
+	if r.connCancel != nil {
+		r.connCancel()
+	}
 	r.mu.Unlock()
 
-	r.SetIsConnected(false)
-	r.emitEvent(Event{Type: EventClose})
-
-	r.closeOnce.Do(func() {
-		close(r.stopCh)
-	})
+	r.setIsConnected(false)
 }
 
 // CloseAndReconnect closes the connection and starts a reconnection attempt
@@ -292,16 +351,18 @@ func (r *Resws) CloseAndReconnect() {
 		_ = r.Conn.Close()
 		r.Conn = nil
 	}
+	if r.connCancel != nil {
+		r.connCancel()
+	}
+
+	r.connectedCh = make(chan struct{}, 1)
+	r.connOnce = new(sync.Once)
 	r.mu.Unlock()
-	r.SetIsConnected(false)
 
-	r.closeOnce.Do(func() {
-		close(r.stopCh)
-	})
+	r.setIsConnected(false)
 
-	r.stopCh = make(chan struct{})
-	r.closeOnce = sync.Once{}
-	r.connectedCh = make(chan struct{})
+	// Wait for the connection to close
+	time.Sleep(100 * time.Millisecond)
 
 	go r.connect()
 }
@@ -316,6 +377,8 @@ func (r *Resws) getHandshakeTimeout() time.Duration {
 
 // Dial establishes a connection to the WebSocket server
 func (r *Resws) Dial(url string) {
+	r.ctx, r.cancel = context.WithCancel(context.Background())
+
 	urlStr, err := r.parseURL(url)
 	if err != nil {
 		r.lastErr = err
@@ -323,49 +386,58 @@ func (r *Resws) Dial(url string) {
 		return
 	}
 
+	r.mu.Lock()
+	r.connectedCh = make(chan struct{}, 1)
+	r.connOnce = new(sync.Once)
+	r.mu.Unlock()
+
 	r.setURL(urlStr)
 	r.setDefaultConfig()
-
-	r.connectedCh = make(chan struct{})
 
 	go r.connect()
 
 	timer := time.NewTimer(r.getHandshakeTimeout())
 	defer timer.Stop()
 
+	r.mu.RLock()
+	connectedCh := r.connectedCh
+	r.mu.RUnlock()
+
 	select {
 	case <-timer.C:
 		return
-	case <-r.connectedCh:
+	case <-connectedCh:
 		return
 	}
 }
 
 // connect establishes a connection to the WebSocket server
 func (r *Resws) connect() {
+	r.connCtx, r.connCancel = context.WithCancel(r.ctx)
+
+	r.mu.RLock()
 	recBackoff := r.RecBackoffMin
+	r.mu.RUnlock()
 
 	for {
 		select {
-		case <-r.stopCh:
+		case <-r.ctx.Done():
 			return
 		default:
 			conn, resp, err := r.dialer.Dial(r.url, r.Headers)
 
-			r.mu.Lock()
-			r.Conn = conn
-			r.isConnected = err == nil
-			r.lastConnect = time.Now()
-			r.httpResp = resp
-			r.mu.Unlock()
-
 			if err == nil {
+				r.mu.Lock()
+				r.Conn = conn
+				r.lastConnect = time.Now()
+				r.mu.Unlock()
+
 				if !r.NonVerbose {
 					r.Logger.Info("Connection was successfully established: %s", r.url)
 				}
 
 				// Start message queue processor first to ensure no messages are missed
-				go r.processMessageQueue()
+				go r.processMessageQueue(r.connCtx)
 
 				if r.SubscribeHandler != nil {
 					if err := r.SubscribeHandler(); err != nil {
@@ -378,18 +450,27 @@ func (r *Resws) connect() {
 				}
 
 				if r.PingHandler != nil {
-					go r.heartbeat(conn)
+					go r.heartbeat(r.connCtx)
 				}
 				if r.MessageHandler != nil {
-					go r.reader(conn)
+					go r.reader(r.connCtx)
 				}
 
+				r.setIsConnected(true)
 				r.emitEvent(Event{Type: EventConnected})
-				close(r.connectedCh)
+				r.signalConnected()
 				return
 			}
 
+			r.mu.Lock()
+			r.Conn = nil
+			r.httpResp = resp
 			r.lastErr = err
+			r.shouldReconnect = true
+			r.mu.Unlock()
+
+			r.setIsConnected(false)
+
 			if r.onErrorFn != nil {
 				r.emitEvent(Event{Type: EventError, Error: err})
 			}
@@ -416,7 +497,12 @@ func (r *Resws) Send(msg []byte) error {
 
 	// If we have a connection, try to send directly
 	if conn != nil {
+		if r.WriteDeadline > 0 {
+			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
+		}
+		r.mu.Lock()
 		err := conn.WriteMessage(websocket.TextMessage, msg)
+		r.mu.Unlock()
 		if err == nil {
 			return nil
 		}
@@ -438,24 +524,58 @@ func (r *Resws) Send(msg []byte) error {
 	return nil
 }
 
+func (r *Resws) SendJSON(v any) (err error) {
+	r.mu.RLock()
+	conn := r.Conn
+	r.mu.RUnlock()
+
+	// If we have a connection, try to send directly
+	if conn != nil {
+		if r.WriteDeadline > 0 {
+			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
+		}
+		r.mu.Lock()
+		err = conn.WriteJSON(v)
+		r.mu.Unlock()
+		if err == nil {
+			return nil
+		}
+	}
+
+	// If no connection or send failed, queue the message
+	r.messageQueueMu.Lock()
+	if len(r.messageQueue) >= r.MessageQueueSize {
+		r.messageQueueMu.Unlock()
+		return fmt.Errorf("message queue is full")
+	}
+	r.messageQueue = append(r.messageQueue, v.([]byte))
+	r.messageQueueMu.Unlock()
+
+	if r.Logger == nil {
+		r.Logger = &defaultLogger{}
+	}
+	r.Logger.Debug("Message queued for later delivery")
+	return nil
+}
+
 // processMessageQueue processes messages from the queue and sends them to the WebSocket server
-func (r *Resws) processMessageQueue() {
+func (r *Resws) processMessageQueue(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-r.stopCh:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			r.mu.RLock()
 			conn := r.Conn
 			isConnected := r.isConnected
-			r.mu.RUnlock()
-
 			if !isConnected || conn == nil {
+				r.mu.RUnlock()
 				continue
 			}
+			r.mu.RUnlock()
 
 			r.messageQueueMu.Lock()
 			queueLen := len(r.messageQueue)
@@ -471,7 +591,13 @@ func (r *Resws) processMessageQueue() {
 			r.messageQueueMu.Unlock()
 
 			// Try to send the message
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			r.mu.RLock()
+			if r.WriteDeadline > 0 {
+				conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
+			}
+			r.mu.RUnlock()
+			err := conn.WriteMessage(websocket.TextMessage, msg)
+			if err != nil {
 				r.Logger.Error("Failed to send queued message: %v", err)
 				// If we failed to send, try to requeue the message
 				r.messageQueueMu.Lock()
@@ -490,14 +616,21 @@ func (r *Resws) processMessageQueue() {
 }
 
 // reader loops and reads messages from the WebSocket connection and emits them as events
-func (r *Resws) reader(conn *websocket.Conn) {
+func (r *Resws) reader(ctx context.Context) {
 	for {
 		select {
-		case <-r.stopCh:
+		case <-ctx.Done():
 			return
 		default:
+			r.mu.RLock()
+			conn := r.Conn
+			r.mu.RUnlock()
+
 			if conn == nil {
 				return
+			}
+			if r.ReadDeadline > 0 {
+				conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
 			}
 			msgType, msg, err := conn.ReadMessage()
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
@@ -506,14 +639,15 @@ func (r *Resws) reader(conn *websocket.Conn) {
 			}
 			if err != nil {
 				r.mu.Lock()
+				reconnect := r.shouldReconnect
 				if r.Conn == conn {
 					r.Conn = nil
 				}
 				r.mu.Unlock()
-				conn.Close()
 				r.emitEvent(Event{Type: EventError, Error: err})
-				<-time.After(1000 * time.Millisecond)
-				r.CloseAndReconnect()
+				if reconnect {
+					r.CloseAndReconnect()
+				}
 				return
 			}
 			switch msgType {
@@ -539,16 +673,96 @@ func (r *Resws) ReadMessage() (msgType int, msg []byte, err error) {
 		return msgType, msg, nil
 	}
 	if err != nil {
-		r.CloseAndReconnect()
+		r.mu.Lock()
+		reconnect := r.shouldReconnect
+		r.mu.Unlock()
+		if reconnect {
+			r.CloseAndReconnect()
+		}
 	}
 
 	return
 }
 
+// ReadJSON manually reads a JSON message from the websocket connection
+func (r *Resws) ReadJSON(v any) (err error) {
+	err = errNotConnected
+	if !r.IsConnected() {
+		return
+	}
+	err = r.Conn.ReadJSON(v)
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		r.Close()
+		return
+	}
+	if err != nil {
+		r.mu.Lock()
+		reconnect := r.shouldReconnect
+		r.mu.Unlock()
+		if reconnect {
+			r.CloseAndReconnect()
+		}
+	}
+
+	return
+}
+
+// WriteMessage manually writes a message to the websocket connection
+func (r *Resws) WriteMessage(msgType int, msg []byte) (err error) {
+	err = errNotConnected
+	if !r.IsConnected() {
+		return
+	}
+	r.mu.Lock()
+	err = r.Conn.WriteMessage(msgType, msg)
+	r.mu.Unlock()
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		r.Close()
+		return
+	}
+	if err != nil {
+		r.mu.Lock()
+		reconnect := r.shouldReconnect
+		r.mu.Unlock()
+		if reconnect {
+			r.CloseAndReconnect()
+		}
+	}
+	return
+}
+
+// WriteJSON manually writes a JSON message to the websocket connection
+func (r *Resws) WriteJSON(v any) (err error) {
+	err = errNotConnected
+	if !r.IsConnected() {
+		return
+	}
+	r.mu.Lock()
+	err = r.Conn.WriteJSON(v)
+	r.mu.Unlock()
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		r.Close()
+		return
+	}
+	if err != nil {
+		r.mu.Lock()
+		reconnect := r.shouldReconnect
+		r.mu.Unlock()
+		if reconnect {
+			r.CloseAndReconnect()
+		}
+	}
+	return
+}
+
 // heartbeat sends ping messages to the server to keep the connection alive
-func (r *Resws) heartbeat(conn *websocket.Conn) {
+func (r *Resws) heartbeat(ctx context.Context) {
 	ticker := time.NewTicker(r.PingInterval)
 	defer ticker.Stop()
+
+	r.mu.RLock()
+	conn := r.Conn
+	r.mu.RUnlock()
 
 	_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
 	conn.SetPongHandler(func(appData string) error {
@@ -558,7 +772,7 @@ func (r *Resws) heartbeat(conn *websocket.Conn) {
 
 	for {
 		select {
-		case <-r.stopCh:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(r.PingInterval)); err != nil {

@@ -1,6 +1,31 @@
+/*
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2025 ipanardian, <github.com/ipanardian>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, Subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or Substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 package test
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -148,7 +173,7 @@ func TestReconnectOnInitialFailure(t *testing.T) {
 	assert.Equal(t, false, ws.IsConnected(), "Should be disconnected after start")
 
 	// wait for timeout
-	time.Sleep(2000 * time.Millisecond)
+	time.Sleep(8000 * time.Millisecond)
 
 	// start server
 	shouldServe.Store(true)
@@ -163,7 +188,7 @@ func TestReconnectOnInitialFailure(t *testing.T) {
 	}
 
 	// wait for reconnection
-	time.Sleep(2000 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	assert.GreaterOrEqual(t, atomic.LoadInt32(&connCount), int32(1), "Should have reconnected")
 	assert.Equal(t, true, ws.IsConnected(), "Should be reconnected")
@@ -268,6 +293,38 @@ func TestSendMessage(t *testing.T) {
 	}
 }
 
+func TestSendJSON(t *testing.T) {
+	messageReceived := make(chan []byte, 1)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			messageReceived <- msg
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	testMsg := map[string]string{"message": "test message"}
+	err := ws.SendJSON(testMsg)
+	assert.NoError(t, err)
+
+	select {
+	case msg := <-messageReceived:
+		var receivedMsg map[string]string
+		err := json.Unmarshal(msg, &receivedMsg)
+		assert.NoError(t, err)
+		assert.Equal(t, testMsg, receivedMsg)
+	case <-time.After(time.Second):
+		t.Fatal("Timeout waiting for message")
+	}
+}
+
 func TestMessageQueue(t *testing.T) {
 	var msgReceived sync.WaitGroup
 	msgReceived.Add(1)
@@ -312,6 +369,97 @@ func TestMessageQueue(t *testing.T) {
 	}
 }
 
+func TestReadAndWriteMessage(t *testing.T) {
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			assert.Equal(t, []byte("Hello"), msg)
+
+			// Send a response
+			err = conn.WriteMessage(websocket.TextMessage, []byte("World!"))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.OnConnected(func(url string) {
+		err := ws.WriteMessage(websocket.TextMessage, []byte("Hello"))
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	// Read the message
+	time.Sleep(100 * time.Millisecond)
+	msgType, msg, err := ws.ReadMessage()
+	assert.NoError(t, err)
+	assert.Equal(t, websocket.TextMessage, msgType)
+	assert.Equal(t, []byte("World!"), msg)
+}
+
+func TestReadAndWriteJSON(t *testing.T) {
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		var v map[string]string
+		for {
+			err := conn.ReadJSON(&v)
+			if err != nil {
+				return
+			}
+			assert.Equal(t, map[string]string{"message": "Hello"}, v)
+
+			// Send a response
+			err = conn.WriteJSON(map[string]string{"message": "World!"})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.OnConnected(func(url string) {
+		err := ws.WriteJSON(map[string]string{"message": "Hello"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	// Read the message
+	time.Sleep(100 * time.Millisecond)
+	var v map[string]string
+	err := ws.ReadJSON(&v)
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]string{"message": "World!"}, v)
+}
+
+func TestCloseResilientws(t *testing.T) {
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	ws.Close()
+
+	assert.Equal(t, false, ws.IsConnected(), "Should be disconnected after close")
+}
+
 func TestWebSocketws(t *testing.T) {
 	t.Run("PingHandler", TestPingHandler)
 
@@ -323,5 +471,12 @@ func TestWebSocketws(t *testing.T) {
 
 	t.Run("SendMessage", TestSendMessage)
 
+	t.Run("SendJSON", TestSendJSON)
+
 	t.Run("MessageQueue", TestMessageQueue)
+
+	t.Run("ReadAndWriteMessage", TestReadAndWriteMessage)
+
+	t.Run("ReadAndWriteJSON", TestReadAndWriteJSON)
+
 }

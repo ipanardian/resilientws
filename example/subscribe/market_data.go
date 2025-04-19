@@ -20,18 +20,20 @@ func main() {
 		cancel()
 	}()
 
-	Connect()
+	go Run()
 
 	<-ctx.Done()
 	ws.Close()
+	log.Println("Bye-bye")
 }
 
-func Connect() {
+func Run() {
 	ws = &resilientws.Resws{
 		PingInterval:     5 * time.Second,
 		SubscribeHandler: SubscribeHandler,
-		PingHandler:      PingHandler,
 		MessageHandler:   MessageHandler,
+		ReadDeadline:     5 * time.Second,
+		WriteDeadline:    5 * time.Second,
 		NonVerbose:       true,
 	}
 
