@@ -312,6 +312,79 @@ func TestMessageQueue(t *testing.T) {
 	}
 }
 
+func TestReadAndWriteMessage(t *testing.T) {
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			assert.Equal(t, []byte("Hello"), msg)
+
+			// Send a response
+			err = conn.WriteMessage(websocket.TextMessage, []byte("World!"))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.OnConnected(func(url string) {
+		err := ws.WriteMessage(websocket.TextMessage, []byte("Hello"))
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	// Read the message
+	time.Sleep(100 * time.Millisecond)
+	msgType, msg, err := ws.ReadMessage()
+	assert.NoError(t, err)
+	assert.Equal(t, websocket.TextMessage, msgType)
+	assert.Equal(t, []byte("World!"), msg)
+}
+
+func TestReadAndWriteJSON(t *testing.T) {
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		var v map[string]string
+		for {
+			err := conn.ReadJSON(&v)
+			if err != nil {
+				return
+			}
+			assert.Equal(t, map[string]string{"message": "Hello"}, v)
+
+			// Send a response
+			err = conn.WriteJSON(map[string]string{"message": "World!"})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.OnConnected(func(url string) {
+		err := ws.WriteJSON(map[string]string{"message": "Hello"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	// Read the message
+	time.Sleep(100 * time.Millisecond)
+	var v map[string]string
+	err := ws.ReadJSON(&v)
+	assert.NoError(t, err)
+	assert.Equal(t, map[string]string{"message": "World!"}, v)
+}
+
 func TestWebSocketws(t *testing.T) {
 	t.Run("PingHandler", TestPingHandler)
 
@@ -324,4 +397,8 @@ func TestWebSocketws(t *testing.T) {
 	t.Run("SendMessage", TestSendMessage)
 
 	t.Run("MessageQueue", TestMessageQueue)
+
+	t.Run("ReadAndWriteMessage", TestReadAndWriteMessage)
+
+	t.Run("ReadAndWriteJSON", TestReadAndWriteJSON)
 }
