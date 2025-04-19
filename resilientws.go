@@ -76,6 +76,7 @@ type Resws struct {
 	lastErr         error
 	shouldReconnect bool
 	connectedCh     chan struct{}
+	connOnce        *sync.Once
 
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -159,6 +160,9 @@ func (r *Resws) setDefaultConfig() {
 	}
 	if r.MessageQueueSize == 0 {
 		r.MessageQueueSize = 10
+	}
+	if !r.shouldReconnect {
+		r.shouldReconnect = true
 	}
 	r.dialer = &websocket.Dialer{
 		TLSClientConfig:  r.TLSConfig,
@@ -249,6 +253,19 @@ func (r *Resws) setIsConnected(isConnected bool) {
 	r.isConnected = isConnected
 }
 
+// signalConnected signals the connection state
+func (r *Resws) signalConnected() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.connOnce.Do(func() {
+		select {
+		case r.connectedCh <- struct{}{}:
+		default:
+		}
+	})
+}
+
 // IsConnected returns the connection state
 func (r *Resws) IsConnected() bool {
 	r.mu.RLock()
@@ -301,11 +318,11 @@ func (r *Resws) Close() {
 	r.mu.Unlock()
 
 	r.setIsConnected(false)
-	r.Logger.Debug("Connection closed")
 }
 
 // CloseAndReconnect closes the connection and starts a reconnection attempt
 func (r *Resws) CloseAndReconnect() {
+	r.Logger.Info("CloseAndReconnect")
 	r.mu.Lock()
 	if r.Conn != nil {
 		_ = r.Conn.Close()
@@ -314,17 +331,15 @@ func (r *Resws) CloseAndReconnect() {
 	if r.connCancel != nil {
 		r.connCancel()
 	}
+
+	r.connectedCh = make(chan struct{}, 1)
+	r.connOnce = new(sync.Once)
 	r.mu.Unlock()
 
 	r.setIsConnected(false)
 
 	// Wait for the connection to close
 	time.Sleep(100 * time.Millisecond)
-
-	// Assign new channels under the lock
-	r.mu.Lock()
-	r.connectedCh = make(chan struct{})
-	r.mu.Unlock()
 
 	go r.connect()
 }
@@ -348,10 +363,13 @@ func (r *Resws) Dial(url string) {
 		return
 	}
 
+	r.mu.Lock()
+	r.connectedCh = make(chan struct{}, 1)
+	r.connOnce = new(sync.Once)
+	r.mu.Unlock()
+
 	r.setURL(urlStr)
 	r.setDefaultConfig()
-
-	r.connectedCh = make(chan struct{})
 
 	go r.connect()
 
@@ -387,8 +405,6 @@ func (r *Resws) connect() {
 				r.lastConnect = time.Now()
 				r.mu.Unlock()
 
-				r.setIsConnected(true)
-
 				if !r.NonVerbose {
 					r.Logger.Info("Connection was successfully established: %s", r.url)
 				}
@@ -413,9 +429,9 @@ func (r *Resws) connect() {
 					go r.reader(r.connCtx)
 				}
 
+				r.setIsConnected(true)
 				r.emitEvent(Event{Type: EventConnected})
-
-				r.connectedCh <- struct{}{}
+				r.signalConnected()
 				return
 			}
 
