@@ -1,6 +1,7 @@
 package resilientws
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -63,19 +64,23 @@ type Resws struct {
 	// Ping handler
 	PingHandler func()
 
-	url            string
-	dialer         *websocket.Dialer
-	httpResp       *http.Response
-	mu             sync.RWMutex
-	messageQueue   [][]byte
-	messageQueueMu sync.Mutex
-	eventHandlers  map[EventType][]func(Event)
-	isConnected    bool
-	lastConnect    time.Time
-	lastErr        error
-	connectedCh    chan struct{}
-	stopCh         chan struct{}
-	closeOnce      sync.Once
+	url             string
+	dialer          *websocket.Dialer
+	httpResp        *http.Response
+	mu              sync.RWMutex
+	messageQueue    [][]byte
+	messageQueueMu  sync.Mutex
+	eventHandlers   map[EventType][]func(Event)
+	isConnected     bool
+	lastConnect     time.Time
+	lastErr         error
+	shouldReconnect bool
+	connectedCh     chan struct{}
+
+	ctx        context.Context
+	cancel     context.CancelFunc
+	connCtx    context.Context
+	connCancel context.CancelFunc
 
 	onReconnectingFn func(time.Duration)
 	onConnectedFn    func(string)
@@ -127,10 +132,9 @@ var errNotConnected = errors.New("websocket: not connected")
 // setDefaultConfig sets the default configuration for the WebSocket client
 func (r *Resws) setDefaultConfig() {
 	r.eventHandlers = make(map[EventType][]func(Event))
-	r.stopCh = make(chan struct{})
 
 	if r.RecBackoffMin == 0 {
-		r.RecBackoffMin = 2 * time.Second
+		r.RecBackoffMin = 1 * time.Second
 	}
 	if r.RecBackoffMax == 0 {
 		r.RecBackoffMax = 30 * time.Second
@@ -215,32 +219,32 @@ func (r *Resws) emitEvent(event Event) {
 
 // OnError sets the error handler
 func (r *Resws) OnError(fn func(err error)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	r.onErrorFn = fn
 }
 
 // OnConnected sets the connected handler
 func (r *Resws) OnConnected(fn func(url string)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	r.onConnectedFn = fn
 }
 
 // OnReconnecting sets the reconnection handler
 func (r *Resws) OnReconnecting(fn func(time.Duration)) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	r.onReconnectingFn = fn
 }
 
-// SetIsConnected sets the connection state
-func (r *Resws) SetIsConnected(isConnected bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+// setIsConnected sets the connection state
+func (r *Resws) setIsConnected(isConnected bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	r.isConnected = isConnected
 }
@@ -279,6 +283,8 @@ func (r *Resws) GetHTTPResponse() *http.Response {
 
 // Close closes the connection
 func (r *Resws) Close() {
+	r.cancel()
+
 	r.mu.Lock()
 	if r.Conn == nil {
 		r.mu.Unlock()
@@ -287,14 +293,15 @@ func (r *Resws) Close() {
 
 	r.Conn.Close()
 	r.Conn = nil
+	r.shouldReconnect = false
+
+	if r.connCancel != nil {
+		r.connCancel()
+	}
 	r.mu.Unlock()
 
-	r.SetIsConnected(false)
-	r.emitEvent(Event{Type: EventClose})
-
-	r.closeOnce.Do(func() {
-		close(r.stopCh)
-	})
+	r.setIsConnected(false)
+	r.Logger.Debug("Connection closed")
 }
 
 // CloseAndReconnect closes the connection and starts a reconnection attempt
@@ -304,16 +311,20 @@ func (r *Resws) CloseAndReconnect() {
 		_ = r.Conn.Close()
 		r.Conn = nil
 	}
+	if r.connCancel != nil {
+		r.connCancel()
+	}
 	r.mu.Unlock()
-	r.SetIsConnected(false)
 
-	r.closeOnce.Do(func() {
-		close(r.stopCh)
-	})
+	r.setIsConnected(false)
 
-	r.stopCh = make(chan struct{})
-	r.closeOnce = sync.Once{}
+	// Wait for the connection to close
+	time.Sleep(100 * time.Millisecond)
+
+	// Assign new channels under the lock
+	r.mu.Lock()
 	r.connectedCh = make(chan struct{})
+	r.mu.Unlock()
 
 	go r.connect()
 }
@@ -328,6 +339,8 @@ func (r *Resws) getHandshakeTimeout() time.Duration {
 
 // Dial establishes a connection to the WebSocket server
 func (r *Resws) Dial(url string) {
+	r.ctx, r.cancel = context.WithCancel(context.Background())
+
 	urlStr, err := r.parseURL(url)
 	if err != nil {
 		r.lastErr = err
@@ -355,29 +368,33 @@ func (r *Resws) Dial(url string) {
 
 // connect establishes a connection to the WebSocket server
 func (r *Resws) connect() {
+	r.connCtx, r.connCancel = context.WithCancel(r.ctx)
+
+	r.mu.RLock()
 	recBackoff := r.RecBackoffMin
+	r.mu.RUnlock()
 
 	for {
 		select {
-		case <-r.stopCh:
+		case <-r.ctx.Done():
 			return
 		default:
 			conn, resp, err := r.dialer.Dial(r.url, r.Headers)
 
-			r.mu.Lock()
-			r.Conn = conn
-			r.isConnected = err == nil
-			r.lastConnect = time.Now()
-			r.httpResp = resp
-			r.mu.Unlock()
-
 			if err == nil {
+				r.mu.Lock()
+				r.Conn = conn
+				r.lastConnect = time.Now()
+				r.mu.Unlock()
+
+				r.setIsConnected(true)
+
 				if !r.NonVerbose {
 					r.Logger.Info("Connection was successfully established: %s", r.url)
 				}
 
 				// Start message queue processor first to ensure no messages are missed
-				go r.processMessageQueue()
+				go r.processMessageQueue(r.connCtx)
 
 				if r.SubscribeHandler != nil {
 					if err := r.SubscribeHandler(); err != nil {
@@ -390,18 +407,27 @@ func (r *Resws) connect() {
 				}
 
 				if r.PingHandler != nil {
-					go r.heartbeat(conn)
+					go r.heartbeat(r.connCtx)
 				}
 				if r.MessageHandler != nil {
-					go r.reader(conn)
+					go r.reader(r.connCtx)
 				}
 
 				r.emitEvent(Event{Type: EventConnected})
-				close(r.connectedCh)
+
+				r.connectedCh <- struct{}{}
 				return
 			}
 
+			r.mu.Lock()
+			r.Conn = nil
+			r.httpResp = resp
 			r.lastErr = err
+			r.shouldReconnect = true
+			r.mu.Unlock()
+
+			r.setIsConnected(false)
+
 			if r.onErrorFn != nil {
 				r.emitEvent(Event{Type: EventError, Error: err})
 			}
@@ -454,23 +480,23 @@ func (r *Resws) Send(msg []byte) error {
 }
 
 // processMessageQueue processes messages from the queue and sends them to the WebSocket server
-func (r *Resws) processMessageQueue() {
+func (r *Resws) processMessageQueue(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-r.stopCh:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			r.mu.RLock()
 			conn := r.Conn
 			isConnected := r.isConnected
-			r.mu.RUnlock()
-
 			if !isConnected || conn == nil {
+				r.mu.RUnlock()
 				continue
 			}
+			r.mu.RUnlock()
 
 			r.messageQueueMu.Lock()
 			queueLen := len(r.messageQueue)
@@ -486,10 +512,13 @@ func (r *Resws) processMessageQueue() {
 			r.messageQueueMu.Unlock()
 
 			// Try to send the message
+			r.mu.RLock()
 			if r.WriteDeadline > 0 {
 				conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
 			}
-			if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			r.mu.RUnlock()
+			err := conn.WriteMessage(websocket.TextMessage, msg)
+			if err != nil {
 				r.Logger.Error("Failed to send queued message: %v", err)
 				// If we failed to send, try to requeue the message
 				r.messageQueueMu.Lock()
@@ -508,12 +537,16 @@ func (r *Resws) processMessageQueue() {
 }
 
 // reader loops and reads messages from the WebSocket connection and emits them as events
-func (r *Resws) reader(conn *websocket.Conn) {
+func (r *Resws) reader(ctx context.Context) {
 	for {
 		select {
-		case <-r.stopCh:
+		case <-ctx.Done():
 			return
 		default:
+			r.mu.RLock()
+			conn := r.Conn
+			r.mu.RUnlock()
+
 			if conn == nil {
 				return
 			}
@@ -527,14 +560,15 @@ func (r *Resws) reader(conn *websocket.Conn) {
 			}
 			if err != nil {
 				r.mu.Lock()
+				reconnect := r.shouldReconnect
 				if r.Conn == conn {
 					r.Conn = nil
 				}
 				r.mu.Unlock()
-				conn.Close()
 				r.emitEvent(Event{Type: EventError, Error: err})
-				<-time.After(1000 * time.Millisecond)
-				r.CloseAndReconnect()
+				if reconnect {
+					r.CloseAndReconnect()
+				}
 				return
 			}
 			switch msgType {
@@ -567,9 +601,13 @@ func (r *Resws) ReadMessage() (msgType int, msg []byte, err error) {
 }
 
 // heartbeat sends ping messages to the server to keep the connection alive
-func (r *Resws) heartbeat(conn *websocket.Conn) {
+func (r *Resws) heartbeat(ctx context.Context) {
 	ticker := time.NewTicker(r.PingInterval)
 	defer ticker.Stop()
+
+	r.mu.RLock()
+	conn := r.Conn
+	r.mu.RUnlock()
 
 	_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
 	conn.SetPongHandler(func(appData string) error {
@@ -579,7 +617,7 @@ func (r *Resws) heartbeat(conn *websocket.Conn) {
 
 	for {
 		select {
-		case <-r.stopCh:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(r.PingInterval)); err != nil {
