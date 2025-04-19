@@ -20,10 +20,11 @@ func main() {
 		cancel()
 	}()
 
-	Run()
+	go Run()
 
 	<-ctx.Done()
 	ws.Close()
+	log.Println("Bye-bye")
 }
 
 func Run() {
