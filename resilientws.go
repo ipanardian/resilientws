@@ -322,7 +322,6 @@ func (r *Resws) Close() {
 
 // CloseAndReconnect closes the connection and starts a reconnection attempt
 func (r *Resws) CloseAndReconnect() {
-	r.Logger.Info("CloseAndReconnect")
 	r.mu.Lock()
 	if r.Conn != nil {
 		_ = r.Conn.Close()
@@ -376,10 +375,14 @@ func (r *Resws) Dial(url string) {
 	timer := time.NewTimer(r.getHandshakeTimeout())
 	defer timer.Stop()
 
+	r.mu.RLock()
+	connectedCh := r.connectedCh
+	r.mu.RUnlock()
+
 	select {
 	case <-timer.C:
 		return
-	case <-r.connectedCh:
+	case <-connectedCh:
 		return
 	}
 }
@@ -473,7 +476,9 @@ func (r *Resws) Send(msg []byte) error {
 		if r.WriteDeadline > 0 {
 			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
 		}
+		r.mu.Lock()
 		err := conn.WriteMessage(websocket.TextMessage, msg)
+		r.mu.Unlock()
 		if err == nil {
 			return nil
 		}
@@ -610,9 +615,85 @@ func (r *Resws) ReadMessage() (msgType int, msg []byte, err error) {
 		return msgType, msg, nil
 	}
 	if err != nil {
-		r.CloseAndReconnect()
+		r.mu.Lock()
+		reconnect := r.shouldReconnect
+		r.mu.Unlock()
+		if reconnect {
+			r.CloseAndReconnect()
+		}
 	}
 
+	return
+}
+
+// ReadJSON manually reads a JSON message from the websocket connection
+func (r *Resws) ReadJSON(v any) (err error) {
+	err = errNotConnected
+	if !r.IsConnected() {
+		return
+	}
+	err = r.Conn.ReadJSON(v)
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		r.Close()
+		return
+	}
+	if err != nil {
+		r.mu.Lock()
+		reconnect := r.shouldReconnect
+		r.mu.Unlock()
+		if reconnect {
+			r.CloseAndReconnect()
+		}
+	}
+
+	return
+}
+
+// WriteMessage manually writes a message to the websocket connection
+func (r *Resws) WriteMessage(msgType int, msg []byte) (err error) {
+	err = errNotConnected
+	if !r.IsConnected() {
+		return
+	}
+	r.mu.Lock()
+	err = r.Conn.WriteMessage(msgType, msg)
+	r.mu.Unlock()
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		r.Close()
+		return
+	}
+	if err != nil {
+		r.mu.Lock()
+		reconnect := r.shouldReconnect
+		r.mu.Unlock()
+		if reconnect {
+			r.CloseAndReconnect()
+		}
+	}
+	return
+}
+
+// WriteJSON manually writes a JSON message to the websocket connection
+func (r *Resws) WriteJSON(v any) (err error) {
+	err = errNotConnected
+	if !r.IsConnected() {
+		return
+	}
+	r.mu.Lock()
+	err = r.Conn.WriteJSON(v)
+	r.mu.Unlock()
+	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		r.Close()
+		return
+	}
+	if err != nil {
+		r.mu.Lock()
+		reconnect := r.shouldReconnect
+		r.mu.Unlock()
+		if reconnect {
+			r.CloseAndReconnect()
+		}
+	}
 	return
 }
 
