@@ -385,6 +385,24 @@ func TestReadAndWriteJSON(t *testing.T) {
 	assert.Equal(t, map[string]string{"message": "World!"}, v)
 }
 
+func TestCloseResilientws(t *testing.T) {
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	ws.Close()
+
+	assert.Equal(t, false, ws.IsConnected(), "Should be disconnected after close")
+}
+
 func TestWebSocketws(t *testing.T) {
 	t.Run("PingHandler", TestPingHandler)
 
