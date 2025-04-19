@@ -148,7 +148,7 @@ func TestReconnectOnInitialFailure(t *testing.T) {
 	assert.Equal(t, false, ws.IsConnected(), "Should be disconnected after start")
 
 	// wait for timeout
-	time.Sleep(2000 * time.Millisecond)
+	time.Sleep(8000 * time.Millisecond)
 
 	// start server
 	shouldServe.Store(true)
@@ -163,7 +163,7 @@ func TestReconnectOnInitialFailure(t *testing.T) {
 	}
 
 	// wait for reconnection
-	time.Sleep(2000 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	assert.GreaterOrEqual(t, atomic.LoadInt32(&connCount), int32(1), "Should have reconnected")
 	assert.Equal(t, true, ws.IsConnected(), "Should be reconnected")
