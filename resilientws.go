@@ -500,6 +500,40 @@ func (r *Resws) Send(msg []byte) error {
 	return nil
 }
 
+func (r *Resws) SendJSON(v any) (err error) {
+	r.mu.RLock()
+	conn := r.Conn
+	r.mu.RUnlock()
+
+	// If we have a connection, try to send directly
+	if conn != nil {
+		if r.WriteDeadline > 0 {
+			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
+		}
+		r.mu.Lock()
+		err = conn.WriteJSON(v)
+		r.mu.Unlock()
+		if err == nil {
+			return nil
+		}
+	}
+
+	// If no connection or send failed, queue the message
+	r.messageQueueMu.Lock()
+	if len(r.messageQueue) >= r.MessageQueueSize {
+		r.messageQueueMu.Unlock()
+		return fmt.Errorf("message queue is full")
+	}
+	r.messageQueue = append(r.messageQueue, v.([]byte))
+	r.messageQueueMu.Unlock()
+
+	if r.Logger == nil {
+		r.Logger = &defaultLogger{}
+	}
+	r.Logger.Debug("Message queued for later delivery")
+	return nil
+}
+
 // processMessageQueue processes messages from the queue and sends them to the WebSocket server
 func (r *Resws) processMessageQueue(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond)

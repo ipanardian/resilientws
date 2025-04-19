@@ -1,6 +1,7 @@
 package test
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -268,6 +269,38 @@ func TestSendMessage(t *testing.T) {
 	}
 }
 
+func TestSendJSON(t *testing.T) {
+	messageReceived := make(chan []byte, 1)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			messageReceived <- msg
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	testMsg := map[string]string{"message": "test message"}
+	err := ws.SendJSON(testMsg)
+	assert.NoError(t, err)
+
+	select {
+	case msg := <-messageReceived:
+		var receivedMsg map[string]string
+		err := json.Unmarshal(msg, &receivedMsg)
+		assert.NoError(t, err)
+		assert.Equal(t, testMsg, receivedMsg)
+	case <-time.After(time.Second):
+		t.Fatal("Timeout waiting for message")
+	}
+}
+
 func TestMessageQueue(t *testing.T) {
 	var msgReceived sync.WaitGroup
 	msgReceived.Add(1)
@@ -414,9 +447,12 @@ func TestWebSocketws(t *testing.T) {
 
 	t.Run("SendMessage", TestSendMessage)
 
+	t.Run("SendJSON", TestSendJSON)
+
 	t.Run("MessageQueue", TestMessageQueue)
 
 	t.Run("ReadAndWriteMessage", TestReadAndWriteMessage)
 
 	t.Run("ReadAndWriteJSON", TestReadAndWriteJSON)
+
 }
