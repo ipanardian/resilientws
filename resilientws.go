@@ -30,6 +30,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -45,6 +46,12 @@ type Resws struct {
 
 	// RecBackoffMax is the maximum backoff duration between reconnection attempts
 	RecBackoffMax time.Duration
+
+	// RecBackoffFactor is the factor by which the backoff duration is multiplied
+	RecBackoffFactor float64
+
+	// BackoffType is the type of backoff to use
+	BackoffType BackoffType
 
 	// Handshake timeout
 	HandshakeTimeout time.Duration
@@ -134,6 +141,13 @@ func (l *defaultLogger) Error(msg string, args ...interface{}) {
 	log.Printf("ERROR: "+msg, args...)
 }
 
+type BackoffType int
+
+const (
+	BackoffTypeJitter BackoffType = iota
+	BackoffTypeFixed
+)
+
 type Event struct {
 	Type        EventType
 	Message     []byte
@@ -159,10 +173,13 @@ func (r *Resws) setDefaultConfig() {
 	r.eventHandlers = make(map[EventType][]func(Event))
 
 	if r.RecBackoffMin == 0 {
-		r.RecBackoffMin = 1 * time.Second
+		r.RecBackoffMin = 1000 * time.Millisecond
 	}
 	if r.RecBackoffMax == 0 {
 		r.RecBackoffMax = 30 * time.Second
+	}
+	if r.RecBackoffFactor == 0 {
+		r.RecBackoffFactor = 1.5
 	}
 	if r.HandshakeTimeout == 0 {
 		r.HandshakeTimeout = 2 * time.Second
@@ -419,72 +436,109 @@ func (r *Resws) connect() {
 	recBackoff := r.RecBackoffMin
 	r.mu.RUnlock()
 
+	attempt := 0
+
 	for {
 		select {
 		case <-r.ctx.Done():
 			return
 		default:
 			conn, resp, err := r.dialer.Dial(r.url, r.Headers)
-
-			if err == nil {
-				r.mu.Lock()
-				r.Conn = conn
-				r.lastConnect = time.Now()
-				r.mu.Unlock()
-
-				if !r.NonVerbose {
-					r.Logger.Info("Connection was successfully established: %s", r.url)
-				}
-
-				// Start message queue processor first to ensure no messages are missed
-				go r.processMessageQueue(r.connCtx)
-
-				if r.SubscribeHandler != nil {
-					if err := r.SubscribeHandler(); err != nil {
-						r.Logger.Error("Subscribe handler failed: %v", err)
-						return
-					}
-					if !r.NonVerbose {
-						r.Logger.Info("Subscribe handler was successfully executed")
-					}
-				}
-
-				if r.PingHandler != nil {
-					go r.heartbeat(r.connCtx)
-				}
-				if r.MessageHandler != nil {
-					go r.reader(r.connCtx)
-				}
-
-				r.setIsConnected(true)
-				r.emitEvent(Event{Type: EventConnected})
-				r.signalConnected()
-				return
+			if err != nil {
+				r.handleDialFailure(resp, err, recBackoff)
+				recBackoff = r.backoff(attempt)
+				attempt++
+				continue
 			}
 
 			r.mu.Lock()
-			r.Conn = nil
-			r.httpResp = resp
-			r.lastErr = err
-			r.shouldReconnect = true
+			r.Conn = conn
+			r.lastConnect = time.Now()
 			r.mu.Unlock()
 
-			r.setIsConnected(false)
-
-			if r.onErrorFn != nil {
-				r.emitEvent(Event{Type: EventError, Error: err})
-			}
 			if !r.NonVerbose {
-				r.Logger.Info("will reconnect in %v", recBackoff)
-			}
-			if r.onReconnectingFn != nil {
-				r.emitEvent(Event{Type: EventReconnecting, Data: recBackoff})
+				r.Logger.Info("Connection was successfully established: %s", r.url)
 			}
 
-			time.Sleep(recBackoff)
-			if recBackoff < r.RecBackoffMax {
-				recBackoff *= 2
+			r.signalConnected()
+			r.setIsConnected(true)
+
+			// Start message queue processor
+			go r.processMessageQueue(r.connCtx)
+
+			// Retry subscribe handler with backoff
+			if r.SubscribeHandler != nil {
+				if err := r.retrySubscribeHandler(); err != nil {
+					r.CloseAndReconnect()
+					return
+				}
 			}
+
+			if r.PingHandler != nil {
+				go r.heartbeat(r.connCtx)
+			}
+			if r.MessageHandler != nil {
+				go r.reader(r.connCtx)
+			}
+
+			r.emitEvent(Event{Type: EventConnected})
+
+			return
+		}
+	}
+}
+
+func (r *Resws) handleDialFailure(resp *http.Response, err error, backoff time.Duration) {
+	r.mu.Lock()
+	r.Conn = nil
+	r.httpResp = resp
+	r.lastErr = err
+	r.shouldReconnect = true
+	r.mu.Unlock()
+
+	r.setIsConnected(false)
+
+	if r.onErrorFn != nil {
+		r.emitEvent(Event{Type: EventError, Error: err})
+	}
+	if !r.NonVerbose {
+		r.Logger.Info("Will reconnect in %v", backoff)
+	}
+	if r.onReconnectingFn != nil {
+		r.emitEvent(Event{Type: EventReconnecting, Data: backoff})
+	}
+
+	time.Sleep(backoff)
+}
+
+func (r *Resws) retrySubscribeHandler() error {
+	r.mu.RLock()
+	backoff := r.RecBackoffMin
+	max := r.RecBackoffMax
+	r.mu.RUnlock()
+
+	attempt := 0
+
+	for {
+		if err := r.SubscribeHandler(); err != nil {
+			r.Logger.Error("Subscribe handler failed: %v", err)
+			r.emitEvent(Event{Type: EventError, Error: err})
+
+			if backoff >= max {
+				return fmt.Errorf("subscribe handler failed after max retries: %w", err)
+			}
+
+			if !r.NonVerbose {
+				r.Logger.Info("Retrying subscribe handler in %v", backoff)
+			}
+			time.Sleep(backoff)
+			backoff = r.backoff(attempt)
+			attempt++
+		} else {
+			if !r.NonVerbose {
+				r.Logger.Info("Subscribe handler executed successfully")
+			}
+			return nil
 		}
 	}
 }
@@ -654,6 +708,7 @@ func (r *Resws) reader(ctx context.Context) {
 			case websocket.TextMessage, websocket.BinaryMessage:
 				r.MessageHandler(msgType, msg)
 			case websocket.CloseMessage:
+				// TODO: handle close message
 				r.emitEvent(Event{Type: EventClose})
 				return
 			}
@@ -781,4 +836,31 @@ func (r *Resws) heartbeat(ctx context.Context) {
 			r.PingHandler()
 		}
 	}
+}
+
+func (r *Resws) backoff(attempt int) time.Duration {
+	min := r.RecBackoffMin
+	max := r.RecBackoffMax
+	if min >= max {
+		return max
+	}
+	backoffFactor := r.RecBackoffFactor
+	if backoffFactor == 0 {
+		backoffFactor = 1.5
+	}
+
+	backoff := min * time.Duration(1<<attempt)
+	backoff = time.Duration(float64(backoff) * backoffFactor)
+	if r.BackoffType == BackoffTypeJitter {
+		backoff = time.Duration(float64(backoff) * (1 + 0.1*rand.Float64()))
+	}
+
+	if backoff < min {
+		return min
+	}
+	if backoff > max {
+		return max
+	}
+
+	return backoff.Round(100 * time.Millisecond)
 }

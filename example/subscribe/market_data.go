@@ -15,7 +15,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
-		time.Sleep(10 * time.Second)
+		time.Sleep(60 * time.Second)
 		log.Println("Closing connection after 10 seconds")
 		cancel()
 	}()
@@ -42,7 +42,9 @@ func Run() {
 	})
 	ws.OnReconnecting(func(d time.Duration) {
 		log.Println("Will reconnect in", d)
-		log.Println("LastConnectTime:", ws.LastConnectTime())
+		if !ws.LastConnectTime().IsZero() {
+			log.Println("LastConnectTime:", ws.LastConnectTime())
+		}
 	})
 	ws.OnError(func(err error) {
 		log.Println("Error:", err)
