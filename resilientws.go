@@ -687,7 +687,7 @@ func (r *Resws) reader(ctx context.Context) {
 				conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
 			}
 			msgType, msg, err := conn.ReadMessage()
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.ClosePolicyViolation) {
 				r.Close()
 				return
 			}
@@ -700,6 +700,8 @@ func (r *Resws) reader(ctx context.Context) {
 				r.mu.Unlock()
 				r.emitEvent(Event{Type: EventError, Error: err})
 				if reconnect {
+					// Wait for a second before reconnecting
+					time.Sleep(1 * time.Second)
 					r.CloseAndReconnect()
 				}
 				return
@@ -775,14 +777,7 @@ func (r *Resws) WriteMessage(msgType int, msg []byte) (err error) {
 		r.Close()
 		return
 	}
-	if err != nil {
-		r.mu.Lock()
-		reconnect := r.shouldReconnect
-		r.mu.Unlock()
-		if reconnect {
-			r.CloseAndReconnect()
-		}
-	}
+
 	return
 }
 
@@ -799,14 +794,7 @@ func (r *Resws) WriteJSON(v any) (err error) {
 		r.Close()
 		return
 	}
-	if err != nil {
-		r.mu.Lock()
-		reconnect := r.shouldReconnect
-		r.mu.Unlock()
-		if reconnect {
-			r.CloseAndReconnect()
-		}
-	}
+
 	return
 }
 
