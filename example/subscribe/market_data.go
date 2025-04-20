@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/ipanardian/resilientws"
 )
 
@@ -15,7 +16,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
-		time.Sleep(60 * time.Second)
+		time.Sleep(10 * time.Second)
 		log.Println("Closing connection after 10 seconds")
 		cancel()
 	}()
@@ -29,7 +30,8 @@ func main() {
 
 func Run() {
 	ws = &resilientws.Resws{
-		PingInterval:     5 * time.Second,
+		PingInterval:     10 * time.Second,
+		PingHandler:      PingHandler,
 		SubscribeHandler: SubscribeHandler,
 		MessageHandler:   MessageHandler,
 		ReadDeadline:     5 * time.Second,
@@ -50,21 +52,28 @@ func Run() {
 		log.Println("Error:", err)
 	})
 
-	u := url.URL{Scheme: "wss", Host: "ws-feed.exchange.coinbase.com"}
+	u := url.URL{Scheme: "wss", Host: "stream.binance.com:9443", Path: "/ws"}
 	ws.Dial(u.String())
 }
 
 func PingHandler() {
-	log.Println("Send ping")
-	err := ws.Send([]byte(`ping`))
+	if !ws.IsConnected() {
+		return
+	}
+	err := ws.WriteMessage(websocket.PingMessage, []byte{})
 	if err != nil {
 		log.Println("Ping error:", err)
 	}
+	log.Println("Sent ping")
 }
 
 func SubscribeHandler() error {
-	subscribe := `{"type":"subscribe","channels":["ticker"],"product_ids":["BTC-USD"]}`
-	err := ws.Send([]byte(subscribe))
+	subscribe := map[string]any{
+		"method": "SUBSCRIBE",
+		"params": []string{"btcusdt@aggTrade"},
+		"id":     1,
+	}
+	err := ws.WriteJSON(subscribe)
 	if err != nil {
 		return err
 	}
