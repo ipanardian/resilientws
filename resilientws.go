@@ -27,6 +27,7 @@ package resilientws
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -602,7 +603,12 @@ func (r *Resws) SendJSON(v any) (err error) {
 		r.messageQueueMu.Unlock()
 		return fmt.Errorf("message queue is full")
 	}
-	r.messageQueue = append(r.messageQueue, v.([]byte))
+	b, err := json.Marshal(v)
+	if err != nil {
+		r.messageQueueMu.Unlock()
+		return err
+	}
+	r.messageQueue = append(r.messageQueue, b)
 	r.messageQueueMu.Unlock()
 
 	if r.Logger == nil {
