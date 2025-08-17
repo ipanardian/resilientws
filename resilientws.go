@@ -108,6 +108,7 @@ type Resws struct {
 	shouldReconnect bool
 	connectedCh     chan struct{}
 	connOnce        *sync.Once
+	closeOnce       sync.Once
 
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -339,31 +340,48 @@ func (r *Resws) GetHTTPResponse() *http.Response {
 
 // Close closes the connection
 func (r *Resws) Close() {
-	r.cancel()
-
-	r.mu.Lock()
-	if r.Conn == nil {
+	r.closeOnce.Do(func() {
+		// Prevent any future reconnect attempts
+		r.mu.Lock()
+		r.shouldReconnect = false
+		conn := r.Conn
+		r.Conn = nil
+		connCancel := r.connCancel
+		r.connCancel = nil
+		cancel := r.cancel
 		r.mu.Unlock()
-		return
-	}
 
-	r.Conn.Close()
-	r.Conn = nil
-	r.shouldReconnect = false
+		if cancel != nil {
+			cancel()
+		}
 
-	if r.connCancel != nil {
-		r.connCancel()
-	}
-	r.mu.Unlock()
+		if conn != nil {
+			// Attempt graceful close
+			deadline := time.Now().Add(250 * time.Millisecond)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+			time.Sleep(100 * time.Millisecond)
+			_ = conn.Close()
+		}
 
-	r.setIsConnected(false)
+		if connCancel != nil {
+			connCancel()
+		}
+
+		r.setIsConnected(false)
+		r.emitEvent(Event{Type: EventClose})
+	})
 }
 
 // CloseAndReconnect closes the connection and starts a reconnection attempt
 func (r *Resws) CloseAndReconnect() {
 	r.mu.Lock()
-	if r.Conn != nil {
-		_ = r.Conn.Close()
+	conn := r.Conn
+	if conn != nil {
+		// Attempt graceful close
+		deadline := time.Now().Add(250 * time.Millisecond)
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+		time.Sleep(100 * time.Millisecond)
+		_ = conn.Close()
 		r.Conn = nil
 	}
 	if r.connCancel != nil {
@@ -404,6 +422,7 @@ func (r *Resws) Dial(url string) {
 	r.mu.Lock()
 	r.connectedCh = make(chan struct{}, 1)
 	r.connOnce = new(sync.Once)
+	r.closeOnce = sync.Once{}
 	r.mu.Unlock()
 
 	r.setURL(urlStr)
@@ -703,8 +722,8 @@ func (r *Resws) reader(ctx context.Context) {
 				r.mu.Unlock()
 				r.emitEvent(Event{Type: EventError, Error: err})
 				if reconnect {
-					// Wait for a second before reconnecting
-					time.Sleep(1 * time.Second)
+					// Wait for a momment before reconnecting
+					time.Sleep(100 * time.Millisecond)
 					r.CloseAndReconnect()
 				}
 				return
@@ -713,8 +732,7 @@ func (r *Resws) reader(ctx context.Context) {
 			case websocket.TextMessage, websocket.BinaryMessage:
 				r.MessageHandler(msgType, msg)
 			case websocket.CloseMessage:
-				// TODO: handle close message
-				r.emitEvent(Event{Type: EventClose})
+				r.Close()
 				return
 			}
 		}
