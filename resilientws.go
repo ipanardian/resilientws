@@ -703,8 +703,8 @@ func (r *Resws) reader(ctx context.Context) {
 				r.mu.Unlock()
 				r.emitEvent(Event{Type: EventError, Error: err})
 				if reconnect {
-					// Wait for a second before reconnecting
-					time.Sleep(1 * time.Second)
+					// Wait for a momment before reconnecting
+					time.Sleep(100 * time.Millisecond)
 					r.CloseAndReconnect()
 				}
 				return
