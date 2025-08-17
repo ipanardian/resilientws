@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/ipanardian/resilientws"
 )
 
@@ -37,18 +38,22 @@ func Run() {
 
 	// sends a message after connection is established with onConnected event
 	ws.OnConnected(func(url string) {
-		err := ws.WriteMessage(1, []byte("Hello"))
+		err := ws.WriteMessage(websocket.TextMessage, []byte("Hello"))
 		if err != nil {
 			log.Println("Write message error:", err)
 		}
 		log.Println("Hello sent")
 	})
 
+	ws.OnError(func(err error) {
+		log.Println("Error:", err)
+	})
+
 	// sends a message while connection is not established
 	// this message will be queued and sent after connection is established
 	ws.Send([]byte("This is a queued message"))
 
-	u := url.URL{Scheme: "wss", Host: "echo.websocket.org"}
+	u := url.URL{Scheme: "wss", Host: "echo.websocket.events"}
 	ws.Dial(u.String())
 }
 

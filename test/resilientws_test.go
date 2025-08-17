@@ -460,6 +460,51 @@ func TestCloseResilientws(t *testing.T) {
 	assert.Equal(t, false, ws.IsConnected(), "Should be disconnected after close")
 }
 
+func TestGracefulCloseSendsCloseFrame(t *testing.T) {
+	// Channel to capture that server received a Close control frame
+	closeReceived := make(chan struct{}, 1)
+
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		// When the server receives a close frame, this handler is invoked
+		conn.SetCloseHandler(func(code int, text string) error {
+			select {
+			case closeReceived <- struct{}{}:
+			default:
+			}
+			// Return nil to accept the close without sending our own close here
+			return nil
+		})
+
+		// Keep reading until the client closes
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.Dial(wsURLFromHTTP(ts.URL))
+
+	// Give the connection a moment to establish
+	time.Sleep(100 * time.Millisecond)
+
+	// Trigger graceful close
+	ws.Close()
+
+	// Server should have received a Close control frame
+	select {
+	case <-closeReceived:
+		// ok
+	case <-time.After(1 * time.Second):
+		t.Fatal("server did not receive a Close control frame from client in time")
+	}
+
+	// Client should be marked disconnected
+	assert.Equal(t, false, ws.IsConnected(), "Should be disconnected after close")
+}
+
 func TestWebSocketws(t *testing.T) {
 	t.Run("PingHandler", TestPingHandler)
 
@@ -479,4 +524,5 @@ func TestWebSocketws(t *testing.T) {
 
 	t.Run("ReadAndWriteJSON", TestReadAndWriteJSON)
 
+	t.Run("GracefulClose", TestGracefulCloseSendsCloseFrame)
 }
