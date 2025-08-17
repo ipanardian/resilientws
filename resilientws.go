@@ -102,7 +102,6 @@ type Resws struct {
 	mu              sync.RWMutex
 	messageQueue    [][]byte
 	messageQueueMu  sync.Mutex
-	eventHandlers   map[EventType][]func(Event)
 	isConnected     bool
 	lastConnect     time.Time
 	lastErr         error
@@ -171,8 +170,6 @@ var errNotConnected = errors.New("websocket: not connected")
 
 // setDefaultConfig sets the default configuration for the WebSocket client
 func (r *Resws) setDefaultConfig() {
-	r.eventHandlers = make(map[EventType][]func(Event))
-
 	if r.RecBackoffMin == 0 {
 		r.RecBackoffMin = 1000 * time.Millisecond
 	}
