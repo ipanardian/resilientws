@@ -556,7 +556,7 @@ func (r *Resws) Send(msg []byte) error {
 
 	// If we have a connection, try to send directly
 	if conn != nil {
-		if r.WriteDeadline > 0 {
+		if r.WriteDeadline > time.Duration(0) {
 			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
 		}
 		r.mu.Lock()
@@ -590,7 +590,7 @@ func (r *Resws) SendJSON(v any) (err error) {
 
 	// If we have a connection, try to send directly
 	if conn != nil {
-		if r.WriteDeadline > 0 {
+		if r.WriteDeadline > time.Duration(0) {
 			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
 		}
 		r.mu.Lock()
@@ -656,7 +656,7 @@ func (r *Resws) processMessageQueue(ctx context.Context) {
 
 			// Try to send the message
 			r.mu.RLock()
-			if r.WriteDeadline > 0 {
+			if r.WriteDeadline > time.Duration(0) {
 				conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
 			}
 			r.mu.RUnlock()
@@ -693,7 +693,7 @@ func (r *Resws) reader(ctx context.Context) {
 			if conn == nil {
 				return
 			}
-			if r.ReadDeadline > 0 {
+			if r.ReadDeadline > time.Duration(0) {
 				conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
 			}
 			msgType, msg, err := conn.ReadMessage()
