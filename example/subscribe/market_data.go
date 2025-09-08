@@ -16,7 +16,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
-		time.Sleep(10 * time.Second)
+		time.Sleep(30 * time.Second)
 		log.Println("Closing connection after 10 seconds")
 		cancel()
 	}()
@@ -34,7 +34,6 @@ func Run() {
 		PingHandler:      PingHandler,
 		SubscribeHandler: SubscribeHandler,
 		MessageHandler:   MessageHandler,
-		ReadDeadline:     5 * time.Second,
 		WriteDeadline:    5 * time.Second,
 		NonVerbose:       true,
 	}
