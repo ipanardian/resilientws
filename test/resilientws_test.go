@@ -337,7 +337,6 @@ func TestMessageQueue(t *testing.T) {
 			}
 			assert.Equal(t, []byte("queued message"), msg)
 			msgReceived.Done()
-			return
 		}
 	})
 	defer ts.Close()

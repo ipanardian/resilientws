@@ -171,6 +171,9 @@ var errNotConnected = errors.New("websocket: not connected")
 
 // setDefaultConfig sets the default configuration for the WebSocket client
 func (r *Resws) setDefaultConfig() {
+	// shouldReconnect is a flag to prevent reconnecting when Close() is called
+	r.shouldReconnect = true
+
 	if r.RecBackoffMin == 0 {
 		r.RecBackoffMin = 1000 * time.Millisecond
 	}
@@ -188,21 +191,6 @@ func (r *Resws) setDefaultConfig() {
 	}
 	if r.PingInterval == 0 {
 		r.PingInterval = 15 * time.Second
-	}
-	if r.PongTimeout == 0 {
-		r.PongTimeout = 20 * time.Second
-	}
-	if r.ReadDeadline == 0 {
-		r.ReadDeadline = 15 * time.Second
-	}
-	if r.WriteDeadline == 0 {
-		r.WriteDeadline = 15 * time.Second
-	}
-	if r.MessageQueueSize == 0 {
-		r.MessageQueueSize = 10
-	}
-	if !r.shouldReconnect {
-		r.shouldReconnect = true
 	}
 	r.dialer = &websocket.Dialer{
 		TLSClientConfig:  r.TLSConfig,
@@ -568,7 +556,7 @@ func (r *Resws) Send(msg []byte) error {
 
 	// If we have a connection, try to send directly
 	if conn != nil {
-		if r.WriteDeadline > 0 {
+		if r.WriteDeadline > time.Duration(0) {
 			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
 		}
 		r.mu.Lock()
@@ -602,7 +590,7 @@ func (r *Resws) SendJSON(v any) (err error) {
 
 	// If we have a connection, try to send directly
 	if conn != nil {
-		if r.WriteDeadline > 0 {
+		if r.WriteDeadline > time.Duration(0) {
 			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
 		}
 		r.mu.Lock()
@@ -668,7 +656,7 @@ func (r *Resws) processMessageQueue(ctx context.Context) {
 
 			// Try to send the message
 			r.mu.RLock()
-			if r.WriteDeadline > 0 {
+			if r.WriteDeadline > time.Duration(0) {
 				conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
 			}
 			r.mu.RUnlock()
@@ -705,7 +693,7 @@ func (r *Resws) reader(ctx context.Context) {
 			if conn == nil {
 				return
 			}
-			if r.ReadDeadline > 0 {
+			if r.ReadDeadline > time.Duration(0) {
 				conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
 			}
 			msgType, msg, err := conn.ReadMessage()
@@ -828,11 +816,13 @@ func (r *Resws) heartbeat(ctx context.Context) {
 	conn := r.Conn
 	r.mu.RUnlock()
 
-	_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
-	conn.SetPongHandler(func(appData string) error {
+	if conn != nil && r.PongTimeout > 0 {
 		_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
-		return nil
-	})
+		conn.SetPongHandler(func(appData string) error {
+			_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
+			return nil
+		})
+	}
 
 	for {
 		select {
