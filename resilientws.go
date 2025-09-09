@@ -54,6 +54,9 @@ type Resws struct {
 	// BackoffType is the type of backoff to use
 	BackoffType BackoffType
 
+	// StableConnectionDuration is the duration a connection must be stable before resetting backoff
+	StableConnectionDuration time.Duration
+
 	// Handshake timeout
 	HandshakeTimeout time.Duration
 
@@ -110,11 +113,18 @@ type Resws struct {
 	connOnce        *sync.Once
 	closeOnce       sync.Once
 
+	// Backoff state that persists across reconnections
+	reconnectAttempts int
+	lastReconnectTime time.Time
+	backoffMu         sync.RWMutex
+
+	// Context for connection management
 	ctx        context.Context
 	cancel     context.CancelFunc
 	connCtx    context.Context
 	connCancel context.CancelFunc
 
+	// Event handlers
 	onReconnectingFn func(time.Duration)
 	onConnectedFn    func(string)
 	onErrorFn        func(error)
@@ -185,6 +195,9 @@ func (r *Resws) setDefaultConfig() {
 	}
 	if r.HandshakeTimeout == 0 {
 		r.HandshakeTimeout = 2 * time.Second
+	}
+	if r.StableConnectionDuration == 0 {
+		r.StableConnectionDuration = 30 * time.Second
 	}
 	if r.Logger == nil {
 		r.Logger = &defaultLogger{}
@@ -360,7 +373,7 @@ func (r *Resws) Close() {
 	})
 }
 
-// CloseAndReconnect closes the connection and starts a reconnection attempt
+// CloseAndReconnect closes the connection and starts a reconnection attempt with backoff
 func (r *Resws) CloseAndReconnect() {
 	r.mu.Lock()
 	conn := r.Conn
@@ -384,6 +397,21 @@ func (r *Resws) CloseAndReconnect() {
 
 	// Wait for the connection to close
 	time.Sleep(100 * time.Millisecond)
+
+	// Increment reconnect attempts for this reconnection
+	r.incrementReconnectAttempts()
+
+	// Apply backoff before reconnecting
+	backoffDuration := r.getReconnectBackoff()
+	if backoffDuration > 0 {
+		if !r.NonVerbose {
+			r.Logger.Info("Will reconnect in %v (attempt %d)", backoffDuration, r.getReconnectAttempts())
+		}
+		if r.onReconnectingFn != nil {
+			r.emitEvent(Event{Type: EventReconnecting, Data: backoffDuration})
+		}
+		time.Sleep(backoffDuration)
+	}
 
 	go r.connect()
 }
@@ -467,6 +495,9 @@ func (r *Resws) connect() {
 
 			r.signalConnected()
 			r.setIsConnected(true)
+
+			// Start connection stability monitor
+			go r.monitorConnectionStability(r.connCtx)
 
 			// Start message queue processor
 			go r.processMessageQueue(r.connCtx)
@@ -862,4 +893,58 @@ func (r *Resws) backoff(attempt int) time.Duration {
 	}
 
 	return backoff.Round(100 * time.Millisecond)
+}
+
+// getReconnectBackoff calculates backoff duration for reconnection attempts
+func (r *Resws) getReconnectBackoff() time.Duration {
+	r.backoffMu.RLock()
+	attempts := r.reconnectAttempts
+	r.backoffMu.RUnlock()
+
+	if attempts <= 1 {
+		return 0 // First connection attempt, no backoff
+	}
+
+	return r.backoff(attempts - 1)
+}
+
+// incrementReconnectAttempts increments the reconnection attempt counter
+func (r *Resws) incrementReconnectAttempts() {
+	r.backoffMu.Lock()
+	r.reconnectAttempts++
+	r.lastReconnectTime = time.Now()
+	r.backoffMu.Unlock()
+}
+
+// getReconnectAttempts returns the current reconnection attempt count
+func (r *Resws) getReconnectAttempts() int {
+	r.backoffMu.RLock()
+	defer r.backoffMu.RUnlock()
+	return r.reconnectAttempts
+}
+
+// resetReconnectAttempts resets the reconnection attempt counter
+func (r *Resws) resetReconnectAttempts() {
+	r.backoffMu.Lock()
+	r.reconnectAttempts = 0
+	r.backoffMu.Unlock()
+}
+
+// monitorConnectionStability monitors connection stability and resets backoff after stable period
+func (r *Resws) monitorConnectionStability(ctx context.Context) {
+	timer := time.NewTimer(r.StableConnectionDuration)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+		// Connection has been stable, reset reconnect attempts
+		if r.IsConnected() {
+			r.resetReconnectAttempts()
+			if !r.NonVerbose {
+				r.Logger.Debug("Connection stable for %v, reset backoff counter", r.StableConnectionDuration)
+			}
+		}
+	}
 }
