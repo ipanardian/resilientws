@@ -502,14 +502,6 @@ func (r *Resws) connect() {
 			// Start message queue processor
 			go r.processMessageQueue(r.connCtx)
 
-			// Retry subscribe handler with backoff
-			if r.SubscribeHandler != nil {
-				if err := r.retrySubscribeHandler(); err != nil {
-					r.CloseAndReconnect()
-					return
-				}
-			}
-
 			if r.PingHandler != nil {
 				go r.heartbeat(r.connCtx)
 			}
@@ -518,6 +510,14 @@ func (r *Resws) connect() {
 			}
 
 			r.emitEvent(Event{Type: EventConnected})
+
+			// Retry subscribe handler with backoff after connection is fully established
+			if r.SubscribeHandler != nil {
+				if err := r.retrySubscribeHandler(); err != nil {
+					r.CloseAndReconnect()
+					return
+				}
+			}
 
 			return
 		}
