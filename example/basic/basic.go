@@ -53,7 +53,7 @@ func Run() {
 	// this message will be queued and sent after connection is established
 	ws.Send([]byte("This is a queued message"))
 
-	u := url.URL{Scheme: "wss", Host: "echo.websocket.events"}
+	u := url.URL{Scheme: "wss", Host: "echo.websocket.org"}
 	ws.Dial(u.String())
 }
 
