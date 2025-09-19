@@ -4,6 +4,8 @@
   "description": "Lightweight and resilient WebSocket client for Go with automatic reconnection, production-ready backoff, subscription resumption, and heartbeat management.",
   "folders": [
     "example",
+    "example/dynamic_subscriptions",
+    "example/auth_header",
     "test"
   ],
   "excludeFolders": [
@@ -21,6 +23,7 @@
     "Expose event callbacks for onConnected, onReconnecting, and onError"
   ],
   "previousVersions": [
+    { "tag": "v0.1.8", "title": "version 0.1.8" },
     { "tag": "v0.1.7", "title": "version 0.1.7" },
     { "tag": "v0.1.6", "title": "version 0.1.6" },
     { "tag": "v0.1.5", "title": "version 0.1.5" },
