@@ -22,6 +22,7 @@
  * SOFTWARE.
  */
 
+// Package resilientws provides a resilient WebSocket client that automatically reconnects and re-subscribes when the connection is lost
 package resilientws
 
 import (
@@ -133,22 +134,22 @@ type Resws struct {
 }
 
 type Logger interface {
-	Debug(msg string, args ...interface{})
-	Info(msg string, args ...interface{})
-	Error(msg string, args ...interface{})
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+	Error(msg string, args ...any)
 }
 
 type defaultLogger struct{}
 
-func (l *defaultLogger) Debug(msg string, args ...interface{}) {
+func (l *defaultLogger) Debug(msg string, args ...any) {
 	log.Printf("DEBUG: "+msg, args...)
 }
 
-func (l *defaultLogger) Info(msg string, args ...interface{}) {
+func (l *defaultLogger) Info(msg string, args ...any) {
 	log.Printf("INFO: "+msg, args...)
 }
 
-func (l *defaultLogger) Error(msg string, args ...interface{}) {
+func (l *defaultLogger) Error(msg string, args ...any) {
 	log.Printf("ERROR: "+msg, args...)
 }
 
@@ -163,7 +164,7 @@ type Event struct {
 	Type        EventType
 	Message     []byte
 	MessageType int
-	Data        interface{}
+	Data        any
 	Error       error
 }
 
