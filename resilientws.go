@@ -861,7 +861,15 @@ func (r *Resws) heartbeat(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(r.PingInterval)); err != nil {
+			r.mu.RLock()
+			currentConn := r.Conn
+			r.mu.RUnlock()
+
+			if currentConn == nil {
+				return
+			}
+
+			if err := currentConn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(r.PingInterval)); err != nil {
 				return
 			}
 			r.PingHandler()
