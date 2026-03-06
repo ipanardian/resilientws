@@ -557,6 +557,12 @@ func (r *Resws) retrySubscribeHandler() error {
 	attempt := 0
 
 	for {
+		select {
+		case <-r.connCtx.Done():
+			return r.connCtx.Err()
+		default:
+		}
+
 		if err := r.SubscribeHandler(); err != nil {
 			r.Logger.Error("Subscribe handler failed: %v", err)
 			r.emitEvent(Event{Type: EventError, Error: err})
@@ -568,7 +574,13 @@ func (r *Resws) retrySubscribeHandler() error {
 			if !r.NonVerbose {
 				r.Logger.Info("Retrying subscribe handler in %v", backoff)
 			}
-			time.Sleep(backoff)
+
+			select {
+			case <-r.connCtx.Done():
+				return r.connCtx.Err()
+			case <-time.After(backoff):
+			}
+
 			backoff = r.backoff(attempt)
 			attempt++
 		} else {
