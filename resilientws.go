@@ -557,6 +557,12 @@ func (r *Resws) retrySubscribeHandler() error {
 	attempt := 0
 
 	for {
+		select {
+		case <-r.connCtx.Done():
+			return r.connCtx.Err()
+		default:
+		}
+
 		if err := r.SubscribeHandler(); err != nil {
 			r.Logger.Error("Subscribe handler failed: %v", err)
 			r.emitEvent(Event{Type: EventError, Error: err})
@@ -568,7 +574,13 @@ func (r *Resws) retrySubscribeHandler() error {
 			if !r.NonVerbose {
 				r.Logger.Info("Retrying subscribe handler in %v", backoff)
 			}
-			time.Sleep(backoff)
+
+			select {
+			case <-r.connCtx.Done():
+				return r.connCtx.Err()
+			case <-time.After(backoff):
+			}
+
 			backoff = r.backoff(attempt)
 			attempt++
 		} else {
@@ -861,7 +873,15 @@ func (r *Resws) heartbeat(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(r.PingInterval)); err != nil {
+			r.mu.RLock()
+			currentConn := r.Conn
+			r.mu.RUnlock()
+
+			if currentConn == nil {
+				return
+			}
+
+			if err := currentConn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(r.PingInterval)); err != nil {
 				return
 			}
 			r.PingHandler()
@@ -880,6 +900,9 @@ func (r *Resws) backoff(attempt int) time.Duration {
 		backoffFactor = 1.5
 	}
 
+	if attempt > 30 {
+		attempt = 30
+	}
 	backoff := min * time.Duration(1<<attempt)
 	backoff = time.Duration(float64(backoff) * backoffFactor)
 	if r.BackoffType == BackoffTypeJitter {

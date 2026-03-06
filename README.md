@@ -1,7 +1,7 @@
 ## Resilient WebSocket Client for Go
 [![Status](https://img.shields.io/badge/status-beta-green.svg)](https://github.com/ipanardian/resilientws/releases)
 [![Go](https://img.shields.io/badge/go-v1.22.x-blue.svg)](https://gitter.im/ipanardian/resilientws)
-[![GitHub license](https://img.shields.io/badge/license-MIT-red.svg)](https://github.com/ipanardian/GoBranch/blob/master/LICENSE)
+[![GitHub license](https://img.shields.io/badge/license-MIT-red.svg)](https://github.com/ipanardian/resilientws/blob/main/LICENSE)
 
 `resilientws` is a lightweight and resilient WebSocket client library built in Go, designed for real-time data streaming applications that require automatic reconnection, subscription resumption, and heartbeat management.
 

@@ -87,7 +87,7 @@ func TestConnectionState(t *testing.T) {
 func TestReconnectAfterServerDisconnect(t *testing.T) {
 	connCount := int32(0)
 	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
-		atomic.AddInt32(&connCount, atomic.LoadInt32(&connCount)+1)
+		atomic.AddInt32(&connCount, 1)
 		if atomic.LoadInt32(&connCount) == 1 {
 			conn.Close()
 			return
@@ -504,6 +504,69 @@ func TestGracefulCloseSendsCloseFrame(t *testing.T) {
 	assert.Equal(t, false, ws.IsConnected(), "Should be disconnected after close")
 }
 
+func TestHeartbeatRaceCondition(t *testing.T) {
+	pingCount := int32(0)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		conn.SetPingHandler(func(appData string) error {
+			atomic.AddInt32(&pingCount, 1)
+			return conn.WriteControl(websocket.PongMessage, []byte{}, time.Now().Add(time.Second))
+		})
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		PingInterval: 100 * time.Millisecond,
+		PingHandler: func() {
+			log.Println("Ping sent")
+		},
+	}
+
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	time.Sleep(250 * time.Millisecond)
+
+	ws.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	assert.GreaterOrEqual(t, atomic.LoadInt32(&pingCount), int32(1), "Should have received at least 1 ping")
+}
+
+func TestSubscribeHandlerContextCancellation(t *testing.T) {
+	subscribeAttempts := int32(0)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		SubscribeHandler: func() error {
+			atomic.AddInt32(&subscribeAttempts, 1)
+			time.Sleep(50 * time.Millisecond)
+			return nil
+		},
+	}
+
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	time.Sleep(100 * time.Millisecond)
+
+	ws.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	attempts := atomic.LoadInt32(&subscribeAttempts)
+	assert.GreaterOrEqual(t, attempts, int32(1), "Should have attempted subscribe at least once")
+	assert.LessOrEqual(t, attempts, int32(3), "Should not retry excessively after close")
+}
+
 func TestWebSocketws(t *testing.T) {
 	t.Run("PingHandler", TestPingHandler)
 
@@ -524,4 +587,8 @@ func TestWebSocketws(t *testing.T) {
 	t.Run("ReadAndWriteJSON", TestReadAndWriteJSON)
 
 	t.Run("GracefulClose", TestGracefulCloseSendsCloseFrame)
+
+	t.Run("HeartbeatRaceCondition", TestHeartbeatRaceCondition)
+
+	t.Run("SubscribeHandlerContextCancellation", TestSubscribeHandlerContextCancellation)
 }

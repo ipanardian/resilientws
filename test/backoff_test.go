@@ -202,8 +202,25 @@ func TestBackoffWithDifferentStrategies(t *testing.T) {
 	}
 }
 
+func TestBackoffOverflowPrevention(t *testing.T) {
+	ws := &resilientws.Resws{
+		RecBackoffMin:    100 * time.Millisecond,
+		RecBackoffMax:    5 * time.Second,
+		RecBackoffFactor: 2.0,
+	}
+
+	ws.Dial("ws://invalid-server-for-testing:9999")
+	defer ws.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	lastErr := ws.LastError()
+	assert.NotNil(t, lastErr, "Should have error from failed connection")
+}
+
 func TestBackoff(t *testing.T) {
 	t.Run("TestBackoffAfterSuccessfulConnection", TestBackoffAfterSuccessfulConnection)
 	t.Run("TestBackoffResetAfterStableConnection", TestBackoffResetAfterStableConnection)
 	t.Run("TestBackoffWithDifferentStrategies", TestBackoffWithDifferentStrategies)
+	t.Run("TestBackoffOverflowPrevention", TestBackoffOverflowPrevention)
 }
