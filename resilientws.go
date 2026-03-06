@@ -125,6 +125,8 @@ type Resws struct {
 	connCtx    context.Context
 	connCancel context.CancelFunc
 
+	connWg sync.WaitGroup
+
 	// Event handlers
 	onReconnectingFn func(time.Duration)
 	onConnectedFn    func(string)
@@ -357,6 +359,10 @@ func (r *Resws) Close() {
 			cancel()
 		}
 
+		if connCancel != nil {
+			connCancel()
+		}
+
 		if conn != nil {
 			// Attempt graceful close
 			deadline := time.Now().Add(250 * time.Millisecond)
@@ -365,9 +371,7 @@ func (r *Resws) Close() {
 			_ = conn.Close()
 		}
 
-		if connCancel != nil {
-			connCancel()
-		}
+		r.connWg.Wait()
 
 		r.setIsConnected(false)
 		r.emitEvent(Event{Type: EventClose})
@@ -464,7 +468,17 @@ func (r *Resws) Dial(url string) {
 
 // connect establishes a connection to the WebSocket server
 func (r *Resws) connect() {
+	r.mu.Lock()
+	if r.connCancel != nil {
+		r.connCancel()
+	}
+	r.mu.Unlock()
+
+	r.connWg.Wait()
+
+	r.mu.Lock()
 	r.connCtx, r.connCancel = context.WithCancel(r.ctx)
+	r.mu.Unlock()
 
 	r.mu.RLock()
 	recBackoff := r.RecBackoffMin
@@ -498,16 +512,32 @@ func (r *Resws) connect() {
 			r.setIsConnected(true)
 
 			// Start connection stability monitor
-			go r.monitorConnectionStability(r.connCtx)
+			r.connWg.Add(1)
+			go func() {
+				defer r.connWg.Done()
+				r.monitorConnectionStability(r.connCtx)
+			}()
 
 			// Start message queue processor
-			go r.processMessageQueue(r.connCtx)
+			r.connWg.Add(1)
+			go func() {
+				defer r.connWg.Done()
+				r.processMessageQueue(r.connCtx)
+			}()
 
 			if r.PingHandler != nil {
-				go r.heartbeat(r.connCtx)
+				r.connWg.Add(1)
+				go func() {
+					defer r.connWg.Done()
+					r.heartbeat(r.connCtx)
+				}()
 			}
 			if r.MessageHandler != nil {
-				go r.reader(r.connCtx)
+				r.connWg.Add(1)
+				go func() {
+					defer r.connWg.Done()
+					r.reader(r.connCtx)
+				}()
 			}
 
 			r.emitEvent(Event{Type: EventConnected})
@@ -742,7 +772,6 @@ func (r *Resws) reader(ctx context.Context) {
 			}
 			msgType, msg, err := conn.ReadMessage()
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.ClosePolicyViolation) {
-				r.Close()
 				return
 			}
 			if err != nil {
@@ -764,7 +793,6 @@ func (r *Resws) reader(ctx context.Context) {
 			case websocket.TextMessage, websocket.BinaryMessage:
 				r.MessageHandler(msgType, msg)
 			case websocket.CloseMessage:
-				r.Close()
 				return
 			}
 		}

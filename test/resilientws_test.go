@@ -567,6 +567,50 @@ func TestSubscribeHandlerContextCancellation(t *testing.T) {
 	assert.LessOrEqual(t, attempts, int32(3), "Should not retry excessively after close")
 }
 
+func TestGoroutineLifecycleManagement(t *testing.T) {
+	connCount := int32(0)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		count := atomic.AddInt32(&connCount, 1)
+		if count <= 2 {
+			// Close first two connections to trigger reconnect
+			time.Sleep(50 * time.Millisecond)
+			conn.Close()
+			return
+		}
+		// Keep subsequent connections alive
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		PingInterval:     100 * time.Millisecond,
+		PingHandler:      func() {},
+		MessageHandler:   func(_ int, msg []byte) {},
+		MessageQueueSize: 10,
+	}
+
+	ws.Dial(wsURLFromHTTP(ts.URL))
+
+	// Wait for multiple reconnection cycles
+	time.Sleep(1500 * time.Millisecond)
+
+	// Verify connections were made
+	finalCount := atomic.LoadInt32(&connCount)
+	assert.GreaterOrEqual(t, finalCount, int32(2), "Should have multiple connections due to reconnections")
+	assert.LessOrEqual(t, finalCount, int32(5), "Should not have excessive connections")
+
+	// Clean close
+	ws.Close()
+	time.Sleep(200 * time.Millisecond)
+
+	assert.Equal(t, false, ws.IsConnected(), "Should be disconnected after close")
+}
+
 func TestWebSocketws(t *testing.T) {
 	t.Run("PingHandler", TestPingHandler)
 
@@ -591,4 +635,6 @@ func TestWebSocketws(t *testing.T) {
 	t.Run("HeartbeatRaceCondition", TestHeartbeatRaceCondition)
 
 	t.Run("SubscribeHandlerContextCancellation", TestSubscribeHandlerContextCancellation)
+
+	t.Run("GoroutineLifecycleManagement", TestGoroutineLifecycleManagement)
 }
