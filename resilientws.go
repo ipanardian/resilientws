@@ -880,6 +880,9 @@ func (r *Resws) backoff(attempt int) time.Duration {
 		backoffFactor = 1.5
 	}
 
+	if attempt > 30 {
+		attempt = 30
+	}
 	backoff := min * time.Duration(1<<attempt)
 	backoff = time.Duration(float64(backoff) * backoffFactor)
 	if r.BackoffType == BackoffTypeJitter {
