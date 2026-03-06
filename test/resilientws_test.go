@@ -87,7 +87,7 @@ func TestConnectionState(t *testing.T) {
 func TestReconnectAfterServerDisconnect(t *testing.T) {
 	connCount := int32(0)
 	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
-		atomic.AddInt32(&connCount, atomic.LoadInt32(&connCount)+1)
+		atomic.AddInt32(&connCount, 1)
 		if atomic.LoadInt32(&connCount) == 1 {
 			conn.Close()
 			return
