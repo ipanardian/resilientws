@@ -27,12 +27,7 @@ package resilientws
 
 import (
 	"context"
-	"crypto/tls"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"log"
-	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -42,145 +37,177 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type Resws struct {
-	// RecBackoffMin is the minimum backoff duration between reconnection attempts
-	RecBackoffMin time.Duration
+// Dial establishes a connection to the WebSocket server
+func (r *Resws) Dial(urlStr string) {
+	r.ctx, r.cancel = context.WithCancel(context.Background())
 
-	// RecBackoffMax is the maximum backoff duration between reconnection attempts
-	RecBackoffMax time.Duration
+	parsed, err := r.parseURL(urlStr)
+	if err != nil {
+		r.lastErr = err
+		r.emitEvent(Event{Type: EventError, Error: err})
+		return
+	}
 
-	// RecBackoffFactor is the factor by which the backoff duration is multiplied
-	RecBackoffFactor float64
+	r.mu.Lock()
+	r.connectedCh = make(chan struct{}, 1)
+	r.connOnce = new(sync.Once)
+	r.closeOnce = sync.Once{}
+	r.mu.Unlock()
 
-	// BackoffType is the type of backoff to use
-	BackoffType BackoffType
+	r.setURL(parsed)
+	r.setDefaultConfig()
 
-	// StableConnectionDuration is the duration a connection must be stable before resetting backoff
-	StableConnectionDuration time.Duration
+	go r.connect()
 
-	// Handshake timeout
-	HandshakeTimeout time.Duration
+	timer := time.NewTimer(r.getHandshakeTimeout())
+	defer timer.Stop()
 
-	// Headers to be sent with the connection
-	Headers http.Header
+	r.mu.RLock()
+	connectedCh := r.connectedCh
+	r.mu.RUnlock()
 
-	// Ping interval
-	PingInterval time.Duration
-
-	// Pong timeout
-	PongTimeout time.Duration
-
-	// Read deadline
-	ReadDeadline time.Duration
-
-	// Write deadline
-	WriteDeadline time.Duration
-
-	// Message queue size
-	MessageQueueSize int
-
-	// TLS configuration
-	TLSConfig *tls.Config
-
-	// Proxy configuration
-	Proxy func(*http.Request) (*url.URL, error)
-
-	// Logger
-	Logger Logger
-
-	// Non-verbose mode
-	NonVerbose bool
-
-	// Subscribe handler
-	SubscribeHandler func() error
-
-	// Message handler
-	MessageHandler func(int, []byte)
-
-	// Ping handler
-	PingHandler func()
-
-	url             string
-	dialer          *websocket.Dialer
-	httpResp        *http.Response
-	mu              sync.RWMutex
-	messageQueue    [][]byte
-	messageQueueMu  sync.Mutex
-	isConnected     bool
-	lastConnect     time.Time
-	lastErr         error
-	shouldReconnect bool
-	connectedCh     chan struct{}
-	connOnce        *sync.Once
-	closeOnce       sync.Once
-
-	// Backoff state that persists across reconnections
-	reconnectAttempts int
-	lastReconnectTime time.Time
-	backoffMu         sync.RWMutex
-
-	// Context for connection management
-	ctx        context.Context
-	cancel     context.CancelFunc
-	connCtx    context.Context
-	connCancel context.CancelFunc
-
-	connWg sync.WaitGroup
-
-	// Event handlers
-	onReconnectingFn func(time.Duration)
-	onConnectedFn    func(string)
-	onErrorFn        func(error)
-
-	*websocket.Conn
+	select {
+	case <-timer.C:
+		return
+	case <-connectedCh:
+		return
+	}
 }
 
-type Logger interface {
-	Debug(msg string, args ...any)
-	Info(msg string, args ...any)
-	Error(msg string, args ...any)
+// OnError sets the error handler
+func (r *Resws) OnError(fn func(err error)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.onErrorFn = fn
 }
 
-type defaultLogger struct{}
+// OnConnected sets the connected handler
+func (r *Resws) OnConnected(fn func(url string)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-func (l *defaultLogger) Debug(msg string, args ...any) {
-	log.Printf("DEBUG: "+msg, args...)
+	r.onConnectedFn = fn
 }
 
-func (l *defaultLogger) Info(msg string, args ...any) {
-	log.Printf("INFO: "+msg, args...)
+// OnReconnecting sets the reconnection handler
+func (r *Resws) OnReconnecting(fn func(time.Duration)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.onReconnectingFn = fn
 }
 
-func (l *defaultLogger) Error(msg string, args ...any) {
-	log.Printf("ERROR: "+msg, args...)
+// Close closes the connection
+func (r *Resws) Close() {
+	r.closeOnce.Do(func() {
+		// Prevent any future reconnect attempts
+		r.mu.Lock()
+		r.shouldReconnect = false
+		conn := r.Conn
+		r.Conn = nil
+		connCancel := r.connCancel
+		r.connCancel = nil
+		cancel := r.cancel
+		r.mu.Unlock()
+
+		if cancel != nil {
+			cancel()
+		}
+
+		if connCancel != nil {
+			connCancel()
+		}
+
+		if conn != nil {
+			// Attempt graceful close
+			deadline := time.Now().Add(250 * time.Millisecond)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+			time.Sleep(100 * time.Millisecond)
+			_ = conn.Close()
+		}
+
+		r.connWg.Wait()
+
+		r.setIsConnected(false)
+		r.emitEvent(Event{Type: EventClose})
+	})
 }
 
-type BackoffType int
+// CloseAndReconnect closes the connection and starts a reconnection attempt with backoff
+func (r *Resws) CloseAndReconnect() {
+	r.mu.Lock()
+	conn := r.Conn
+	r.Conn = nil
+	if r.connCancel != nil {
+		r.connCancel()
+	}
+	r.connectedCh = make(chan struct{}, 1)
+	r.connOnce = new(sync.Once)
+	r.mu.Unlock()
 
-const (
-	BackoffTypeJitter BackoffType = iota
-	BackoffTypeFixed
-)
+	if conn != nil {
+		// Attempt graceful close outside the lock — WriteControl is concurrent-safe
+		deadline := time.Now().Add(250 * time.Millisecond)
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+		time.Sleep(100 * time.Millisecond)
+		_ = conn.Close()
+	}
 
-type Event struct {
-	Type        EventType
-	Message     []byte
-	MessageType int
-	Data        any
-	Error       error
+	r.setIsConnected(false)
+
+	// Wait for the connection to close
+	time.Sleep(100 * time.Millisecond)
+
+	// Increment reconnect attempts for this reconnection
+	r.incrementReconnectAttempts()
+
+	// Apply backoff before reconnecting
+	backoffDuration := r.getReconnectBackoff()
+	if backoffDuration > 0 {
+		if !r.NonVerbose {
+			r.Logger.Info("Will reconnect in %v (attempt %d)", backoffDuration, r.getReconnectAttempts())
+		}
+		if r.onReconnectingFn != nil {
+			r.emitEvent(Event{Type: EventReconnecting, Data: backoffDuration})
+		}
+		time.Sleep(backoffDuration)
+	}
+
+	go r.connect()
 }
 
-type EventType int
+// IsConnected returns the connection state
+func (r *Resws) IsConnected() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-const (
-	EventMessage EventType = iota
-	EventConnected
-	EventReconnecting
-	EventError
-	EventClose
-)
+	return r.isConnected
+}
 
-var errNotConnected = errors.New("websocket: not connected")
+// LastConnectTime returns the last connection time
+func (r *Resws) LastConnectTime() time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.lastConnect
+}
+
+// LastError returns the last error
+func (r *Resws) LastError() error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.lastErr
+}
+
+// GetHTTPResponse returns the HTTP response
+func (r *Resws) GetHTTPResponse() *http.Response {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	return r.httpResp
+}
 
 // setDefaultConfig sets the default configuration for the WebSocket client
 func (r *Resws) setDefaultConfig() {
@@ -256,37 +283,15 @@ func (r *Resws) emitEvent(event Event) {
 		}
 	case EventReconnecting:
 		if r.onReconnectingFn != nil {
-			r.onReconnectingFn(event.Data.(time.Duration))
+			if d, ok := event.Data.(time.Duration); ok {
+				r.onReconnectingFn(d)
+			}
 		}
 	case EventError:
 		if r.onErrorFn != nil {
 			r.onErrorFn(event.Error)
 		}
 	}
-}
-
-// OnError sets the error handler
-func (r *Resws) OnError(fn func(err error)) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.onErrorFn = fn
-}
-
-// OnConnected sets the connected handler
-func (r *Resws) OnConnected(fn func(url string)) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.onConnectedFn = fn
-}
-
-// OnReconnecting sets the reconnection handler
-func (r *Resws) OnReconnecting(fn func(time.Duration)) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.onReconnectingFn = fn
 }
 
 // setIsConnected sets the connection state
@@ -310,693 +315,10 @@ func (r *Resws) signalConnected() {
 	})
 }
 
-// IsConnected returns the connection state
-func (r *Resws) IsConnected() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.isConnected
-}
-
-// LastConnectTime returns the last connection time
-func (r *Resws) LastConnectTime() time.Time {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.lastConnect
-}
-
-// LastError returns the last error
-func (r *Resws) LastError() error {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.lastErr
-}
-
-// GetHTTPResponse returns the HTTP response
-func (r *Resws) GetHTTPResponse() *http.Response {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
-	return r.httpResp
-}
-
-// Close closes the connection
-func (r *Resws) Close() {
-	r.closeOnce.Do(func() {
-		// Prevent any future reconnect attempts
-		r.mu.Lock()
-		r.shouldReconnect = false
-		conn := r.Conn
-		r.Conn = nil
-		connCancel := r.connCancel
-		r.connCancel = nil
-		cancel := r.cancel
-		r.mu.Unlock()
-
-		if cancel != nil {
-			cancel()
-		}
-
-		if connCancel != nil {
-			connCancel()
-		}
-
-		if conn != nil {
-			// Attempt graceful close
-			deadline := time.Now().Add(250 * time.Millisecond)
-			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
-			time.Sleep(100 * time.Millisecond)
-			_ = conn.Close()
-		}
-
-		r.connWg.Wait()
-
-		r.setIsConnected(false)
-		r.emitEvent(Event{Type: EventClose})
-	})
-}
-
-// CloseAndReconnect closes the connection and starts a reconnection attempt with backoff
-func (r *Resws) CloseAndReconnect() {
-	r.mu.Lock()
-	conn := r.Conn
-	if conn != nil {
-		// Attempt graceful close
-		deadline := time.Now().Add(250 * time.Millisecond)
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
-		time.Sleep(100 * time.Millisecond)
-		_ = conn.Close()
-		r.Conn = nil
-	}
-	if r.connCancel != nil {
-		r.connCancel()
-	}
-
-	r.connectedCh = make(chan struct{}, 1)
-	r.connOnce = new(sync.Once)
-	r.mu.Unlock()
-
-	r.setIsConnected(false)
-
-	// Wait for the connection to close
-	time.Sleep(100 * time.Millisecond)
-
-	// Increment reconnect attempts for this reconnection
-	r.incrementReconnectAttempts()
-
-	// Apply backoff before reconnecting
-	backoffDuration := r.getReconnectBackoff()
-	if backoffDuration > 0 {
-		if !r.NonVerbose {
-			r.Logger.Info("Will reconnect in %v (attempt %d)", backoffDuration, r.getReconnectAttempts())
-		}
-		if r.onReconnectingFn != nil {
-			r.emitEvent(Event{Type: EventReconnecting, Data: backoffDuration})
-		}
-		time.Sleep(backoffDuration)
-	}
-
-	go r.connect()
-}
-
 // getHandshakeTimeout returns the handshake timeout
 func (r *Resws) getHandshakeTimeout() time.Duration {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	return r.HandshakeTimeout
-}
-
-// Dial establishes a connection to the WebSocket server
-func (r *Resws) Dial(url string) {
-	r.ctx, r.cancel = context.WithCancel(context.Background())
-
-	urlStr, err := r.parseURL(url)
-	if err != nil {
-		r.lastErr = err
-		r.emitEvent(Event{Type: EventError, Error: err})
-		return
-	}
-
-	r.mu.Lock()
-	r.connectedCh = make(chan struct{}, 1)
-	r.connOnce = new(sync.Once)
-	r.closeOnce = sync.Once{}
-	r.mu.Unlock()
-
-	r.setURL(urlStr)
-	r.setDefaultConfig()
-
-	go r.connect()
-
-	timer := time.NewTimer(r.getHandshakeTimeout())
-	defer timer.Stop()
-
-	r.mu.RLock()
-	connectedCh := r.connectedCh
-	r.mu.RUnlock()
-
-	select {
-	case <-timer.C:
-		return
-	case <-connectedCh:
-		return
-	}
-}
-
-// connect establishes a connection to the WebSocket server
-func (r *Resws) connect() {
-	r.mu.Lock()
-	if r.connCancel != nil {
-		r.connCancel()
-	}
-	r.mu.Unlock()
-
-	r.connWg.Wait()
-
-	r.mu.Lock()
-	r.connCtx, r.connCancel = context.WithCancel(r.ctx)
-	r.mu.Unlock()
-
-	r.mu.RLock()
-	recBackoff := r.RecBackoffMin
-	r.mu.RUnlock()
-
-	attempt := 0
-
-	for {
-		select {
-		case <-r.ctx.Done():
-			return
-		default:
-			conn, resp, err := r.dialer.Dial(r.url, r.Headers)
-			if err != nil {
-				r.handleDialFailure(resp, err, recBackoff)
-				recBackoff = r.backoff(attempt)
-				attempt++
-				continue
-			}
-
-			r.mu.Lock()
-			r.Conn = conn
-			r.lastConnect = time.Now()
-			r.mu.Unlock()
-
-			if !r.NonVerbose {
-				r.Logger.Info("Connection was successfully established: %s", r.url)
-			}
-
-			r.signalConnected()
-			r.setIsConnected(true)
-
-			// Start connection stability monitor
-			r.connWg.Add(1)
-			go func() {
-				defer r.connWg.Done()
-				r.monitorConnectionStability(r.connCtx)
-			}()
-
-			// Start message queue processor
-			r.connWg.Add(1)
-			go func() {
-				defer r.connWg.Done()
-				r.processMessageQueue(r.connCtx)
-			}()
-
-			if r.PingHandler != nil {
-				r.connWg.Add(1)
-				go func() {
-					defer r.connWg.Done()
-					r.heartbeat(r.connCtx)
-				}()
-			}
-			if r.MessageHandler != nil {
-				r.connWg.Add(1)
-				go func() {
-					defer r.connWg.Done()
-					r.reader(r.connCtx)
-				}()
-			}
-
-			r.emitEvent(Event{Type: EventConnected})
-
-			// Retry subscribe handler with backoff after connection is fully established
-			if r.SubscribeHandler != nil {
-				if err := r.retrySubscribeHandler(); err != nil {
-					r.CloseAndReconnect()
-					return
-				}
-			}
-
-			return
-		}
-	}
-}
-
-func (r *Resws) handleDialFailure(resp *http.Response, err error, backoff time.Duration) {
-	r.mu.Lock()
-	r.Conn = nil
-	r.httpResp = resp
-	r.lastErr = err
-	r.shouldReconnect = true
-	r.mu.Unlock()
-
-	r.setIsConnected(false)
-
-	if r.onErrorFn != nil {
-		r.emitEvent(Event{Type: EventError, Error: err})
-	}
-	if !r.NonVerbose {
-		r.Logger.Info("Will reconnect in %v", backoff)
-	}
-	if r.onReconnectingFn != nil {
-		r.emitEvent(Event{Type: EventReconnecting, Data: backoff})
-	}
-
-	time.Sleep(backoff)
-}
-
-func (r *Resws) retrySubscribeHandler() error {
-	r.mu.RLock()
-	backoff := r.RecBackoffMin
-	max := r.RecBackoffMax
-	r.mu.RUnlock()
-
-	attempt := 0
-
-	for {
-		select {
-		case <-r.connCtx.Done():
-			return r.connCtx.Err()
-		default:
-		}
-
-		if err := r.SubscribeHandler(); err != nil {
-			r.Logger.Error("Subscribe handler failed: %v", err)
-			r.emitEvent(Event{Type: EventError, Error: err})
-
-			if backoff >= max {
-				return fmt.Errorf("subscribe handler failed after max retries: %w", err)
-			}
-
-			if !r.NonVerbose {
-				r.Logger.Info("Retrying subscribe handler in %v", backoff)
-			}
-
-			select {
-			case <-r.connCtx.Done():
-				return r.connCtx.Err()
-			case <-time.After(backoff):
-			}
-
-			backoff = r.backoff(attempt)
-			attempt++
-		} else {
-			if !r.NonVerbose {
-				r.Logger.Info("Subscribe handler executed successfully")
-			}
-			return nil
-		}
-	}
-}
-
-// Send sends a message to the WebSocket server with a fallback queue
-func (r *Resws) Send(msg []byte) error {
-	r.mu.RLock()
-	conn := r.Conn
-	r.mu.RUnlock()
-
-	// If we have a connection, try to send directly
-	if conn != nil {
-		if r.WriteDeadline > time.Duration(0) {
-			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
-		}
-		r.mu.Lock()
-		err := conn.WriteMessage(websocket.TextMessage, msg)
-		r.mu.Unlock()
-		if err == nil {
-			return nil
-		}
-	}
-
-	// If no connection or send failed, queue the message
-	r.messageQueueMu.Lock()
-	if len(r.messageQueue) >= r.MessageQueueSize {
-		r.messageQueueMu.Unlock()
-		return fmt.Errorf("message queue is full")
-	}
-	r.messageQueue = append(r.messageQueue, msg)
-	r.messageQueueMu.Unlock()
-
-	if r.Logger == nil {
-		r.Logger = &defaultLogger{}
-	}
-	r.Logger.Debug("Message queued for later delivery")
-	return nil
-}
-
-func (r *Resws) SendJSON(v any) (err error) {
-	r.mu.RLock()
-	conn := r.Conn
-	r.mu.RUnlock()
-
-	// If we have a connection, try to send directly
-	if conn != nil {
-		if r.WriteDeadline > time.Duration(0) {
-			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
-		}
-		r.mu.Lock()
-		err = conn.WriteJSON(v)
-		r.mu.Unlock()
-		if err == nil {
-			return nil
-		}
-	}
-
-	// If no connection or send failed, queue the message
-	r.messageQueueMu.Lock()
-	if len(r.messageQueue) >= r.MessageQueueSize {
-		r.messageQueueMu.Unlock()
-		return fmt.Errorf("message queue is full")
-	}
-	b, err := json.Marshal(v)
-	if err != nil {
-		r.messageQueueMu.Unlock()
-		return err
-	}
-	r.messageQueue = append(r.messageQueue, b)
-	r.messageQueueMu.Unlock()
-
-	if r.Logger == nil {
-		r.Logger = &defaultLogger{}
-	}
-	r.Logger.Debug("Message queued for later delivery")
-	return nil
-}
-
-// processMessageQueue processes messages from the queue and sends them to the WebSocket server
-func (r *Resws) processMessageQueue(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			r.mu.RLock()
-			conn := r.Conn
-			isConnected := r.isConnected
-			if !isConnected || conn == nil {
-				r.mu.RUnlock()
-				continue
-			}
-			r.mu.RUnlock()
-
-			r.messageQueueMu.Lock()
-			queueLen := len(r.messageQueue)
-			if queueLen == 0 {
-				r.messageQueueMu.Unlock()
-				continue
-			}
-
-			// Get the first message
-			msg := r.messageQueue[0]
-			// Remove it from the queue
-			r.messageQueue = r.messageQueue[1:]
-			r.messageQueueMu.Unlock()
-
-			// Try to send the message
-			r.mu.RLock()
-			if r.WriteDeadline > time.Duration(0) {
-				conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
-			}
-			r.mu.RUnlock()
-			err := conn.WriteMessage(websocket.TextMessage, msg)
-			if err != nil {
-				r.Logger.Error("Failed to send queued message: %v", err)
-				// If we failed to send, try to requeue the message
-				r.messageQueueMu.Lock()
-				if len(r.messageQueue) < r.MessageQueueSize {
-					r.messageQueue = append(r.messageQueue, msg)
-					r.Logger.Debug("Requeued failed message")
-				} else {
-					r.Logger.Error("Failed to requeue message: queue full")
-				}
-				r.messageQueueMu.Unlock()
-			} else {
-				r.Logger.Debug("Successfully sent queued message")
-			}
-		}
-	}
-}
-
-// reader loops and reads messages from the WebSocket connection and emits them as events
-func (r *Resws) reader(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			r.mu.RLock()
-			conn := r.Conn
-			r.mu.RUnlock()
-
-			if conn == nil {
-				return
-			}
-			if r.ReadDeadline > time.Duration(0) {
-				conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
-			}
-			msgType, msg, err := conn.ReadMessage()
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.ClosePolicyViolation) {
-				return
-			}
-			if err != nil {
-				r.mu.Lock()
-				reconnect := r.shouldReconnect
-				if r.Conn == conn {
-					r.Conn = nil
-				}
-				r.mu.Unlock()
-				r.emitEvent(Event{Type: EventError, Error: err})
-				if reconnect {
-					// Wait for a momment before reconnecting
-					time.Sleep(100 * time.Millisecond)
-					r.CloseAndReconnect()
-				}
-				return
-			}
-			switch msgType {
-			case websocket.TextMessage, websocket.BinaryMessage:
-				r.MessageHandler(msgType, msg)
-			case websocket.CloseMessage:
-				return
-			}
-		}
-	}
-}
-
-// ReadMessage manually reads a message from the websocket connection
-func (r *Resws) ReadMessage() (msgType int, msg []byte, err error) {
-	err = errNotConnected
-	if !r.IsConnected() {
-		return
-	}
-	msgType, msg, err = r.Conn.ReadMessage()
-	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-		r.Close()
-		return msgType, msg, nil
-	}
-	if err != nil {
-		r.mu.Lock()
-		reconnect := r.shouldReconnect
-		r.mu.Unlock()
-		if reconnect {
-			r.CloseAndReconnect()
-		}
-	}
-
-	return
-}
-
-// ReadJSON manually reads a JSON message from the websocket connection
-func (r *Resws) ReadJSON(v any) (err error) {
-	err = errNotConnected
-	if !r.IsConnected() {
-		return
-	}
-	err = r.Conn.ReadJSON(v)
-	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-		r.Close()
-		return
-	}
-	if err != nil {
-		r.mu.Lock()
-		reconnect := r.shouldReconnect
-		r.mu.Unlock()
-		if reconnect {
-			r.CloseAndReconnect()
-		}
-	}
-
-	return
-}
-
-// WriteMessage manually writes a message to the websocket connection
-func (r *Resws) WriteMessage(msgType int, msg []byte) (err error) {
-	err = errNotConnected
-	if !r.IsConnected() {
-		return
-	}
-	r.mu.Lock()
-	err = r.Conn.WriteMessage(msgType, msg)
-	r.mu.Unlock()
-	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-		r.Close()
-		return
-	}
-
-	return
-}
-
-// WriteJSON manually writes a JSON message to the websocket connection
-func (r *Resws) WriteJSON(v any) (err error) {
-	err = errNotConnected
-	if !r.IsConnected() {
-		return
-	}
-	r.mu.Lock()
-	err = r.Conn.WriteJSON(v)
-	r.mu.Unlock()
-	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-		r.Close()
-		return
-	}
-
-	return
-}
-
-// heartbeat sends ping messages to the server to keep the connection alive
-func (r *Resws) heartbeat(ctx context.Context) {
-	ticker := time.NewTicker(r.PingInterval)
-	defer ticker.Stop()
-
-	r.mu.RLock()
-	conn := r.Conn
-	r.mu.RUnlock()
-
-	if conn != nil && r.PongTimeout > 0 {
-		_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
-		conn.SetPongHandler(func(appData string) error {
-			_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
-			return nil
-		})
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			r.mu.RLock()
-			currentConn := r.Conn
-			r.mu.RUnlock()
-
-			if currentConn == nil {
-				return
-			}
-
-			if err := currentConn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(r.PingInterval)); err != nil {
-				return
-			}
-			r.PingHandler()
-		}
-	}
-}
-
-func (r *Resws) backoff(attempt int) time.Duration {
-	min := r.RecBackoffMin
-	max := r.RecBackoffMax
-	if min >= max {
-		return max
-	}
-	backoffFactor := r.RecBackoffFactor
-	if backoffFactor == 0 {
-		backoffFactor = 1.5
-	}
-
-	if attempt > 30 {
-		attempt = 30
-	}
-	backoff := min * time.Duration(1<<attempt)
-	backoff = time.Duration(float64(backoff) * backoffFactor)
-	if r.BackoffType == BackoffTypeJitter {
-		backoff = time.Duration(float64(backoff) * (1 + 0.1*rand.Float64()))
-	}
-
-	if backoff < min {
-		return min
-	}
-	if backoff > max {
-		return max
-	}
-
-	return backoff.Round(100 * time.Millisecond)
-}
-
-// getReconnectBackoff calculates backoff duration for reconnection attempts
-func (r *Resws) getReconnectBackoff() time.Duration {
-	r.backoffMu.RLock()
-	attempts := r.reconnectAttempts
-	r.backoffMu.RUnlock()
-
-	if attempts <= 1 {
-		return 0 // First connection attempt, no backoff
-	}
-
-	return r.backoff(attempts - 1)
-}
-
-// incrementReconnectAttempts increments the reconnection attempt counter
-func (r *Resws) incrementReconnectAttempts() {
-	r.backoffMu.Lock()
-	r.reconnectAttempts++
-	r.lastReconnectTime = time.Now()
-	r.backoffMu.Unlock()
-}
-
-// getReconnectAttempts returns the current reconnection attempt count
-func (r *Resws) getReconnectAttempts() int {
-	r.backoffMu.RLock()
-	defer r.backoffMu.RUnlock()
-	return r.reconnectAttempts
-}
-
-// resetReconnectAttempts resets the reconnection attempt counter
-func (r *Resws) resetReconnectAttempts() {
-	r.backoffMu.Lock()
-	r.reconnectAttempts = 0
-	r.backoffMu.Unlock()
-}
-
-// monitorConnectionStability monitors connection stability and resets backoff after stable period
-func (r *Resws) monitorConnectionStability(ctx context.Context) {
-	timer := time.NewTimer(r.StableConnectionDuration)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return
-	case <-timer.C:
-		// Connection has been stable, reset reconnect attempts
-		if r.IsConnected() {
-			r.resetReconnectAttempts()
-			if !r.NonVerbose {
-				r.Logger.Debug("Connection stable for %v, reset backoff counter", r.StableConnectionDuration)
-			}
-		}
-	}
 }
