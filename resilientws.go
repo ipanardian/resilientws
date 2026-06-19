@@ -736,16 +736,15 @@ func (r *Resws) processMessageQueue(ctx context.Context) {
 			r.mu.RUnlock()
 			err := conn.WriteMessage(websocket.TextMessage, msg)
 			if err != nil {
-				r.Logger.Error("Failed to send queued message: %v", err)
-				// If we failed to send, try to requeue the message
+				r.Logger.Error("[%s] Failed to send queued message, stopping queue processor: %v", r.url, err)
 				r.messageQueueMu.Lock()
 				if len(r.messageQueue) < r.MessageQueueSize {
 					r.messageQueue = append(r.messageQueue, msg)
-					r.Logger.Debug("Requeued failed message")
 				} else {
-					r.Logger.Error("Failed to requeue message: queue full")
+					r.Logger.Error("[%s] Failed to requeue message: queue full", r.url)
 				}
 				r.messageQueueMu.Unlock()
+				return
 			} else {
 				r.Logger.Debug("Successfully sent queued message")
 			}
