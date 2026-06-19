@@ -611,6 +611,80 @@ func TestGoroutineLifecycleManagement(t *testing.T) {
 	assert.Equal(t, false, ws.IsConnected(), "Should be disconnected after close")
 }
 
+func TestQueueProcessorExitsOnWriteFailure(t *testing.T) {
+	connCount := int32(0)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		count := atomic.AddInt32(&connCount, 1)
+		if count == 1 {
+			time.Sleep(50 * time.Millisecond)
+			conn.Close()
+			return
+		}
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		MessageQueueSize: 10,
+		RecBackoffMin:    100 * time.Millisecond,
+		RecBackoffMax:    500 * time.Millisecond,
+	}
+
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	ws.Close()
+	time.Sleep(50 * time.Millisecond)
+
+	for i := 0; i < 5; i++ {
+		_ = ws.Send([]byte("queued message"))
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	time.Sleep(300 * time.Millisecond)
+
+	assert.True(t, ws.IsConnected(), "Should be reconnected")
+}
+
+func TestQueueProcessorNoInfiniteLoop(t *testing.T) {
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		MessageQueueSize: 10,
+	}
+
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	time.Sleep(100 * time.Millisecond)
+	assert.True(t, ws.IsConnected(), "Should be connected")
+
+	_ = ws.Send([]byte("test message"))
+	time.Sleep(200 * time.Millisecond)
+
+	ws.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	assert.False(t, ws.IsConnected(), "Should be disconnected")
+}
+
 func TestWebSocketws(t *testing.T) {
 	t.Run("PingHandler", TestPingHandler)
 
