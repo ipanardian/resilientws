@@ -342,6 +342,21 @@ func (r *Resws) GetHTTPResponse() *http.Response {
 	return r.httpResp
 }
 
+// sleepWithContext sleeps for d, but returns early if r.ctx is cancelled.
+// Returns true if cancelled, false if the full duration elapsed.
+func (r *Resws) sleepWithContext(d time.Duration) bool {
+	if r.ctx == nil {
+		time.Sleep(d)
+		return false
+	}
+	select {
+	case <-r.ctx.Done():
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
 // Close closes the connection
 func (r *Resws) Close() {
 	r.closeOnce.Do(func() {
@@ -382,14 +397,8 @@ func (r *Resws) Close() {
 func (r *Resws) CloseAndReconnect() {
 	r.mu.Lock()
 	conn := r.Conn
-	if conn != nil {
-		// Attempt graceful close
-		deadline := time.Now().Add(250 * time.Millisecond)
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
-		time.Sleep(100 * time.Millisecond)
-		_ = conn.Close()
-		r.Conn = nil
-	}
+	r.Conn = nil
+	r.isConnected = false
 	if r.connCancel != nil {
 		r.connCancel()
 	}
@@ -398,10 +407,16 @@ func (r *Resws) CloseAndReconnect() {
 	r.connOnce = new(sync.Once)
 	r.mu.Unlock()
 
-	r.setIsConnected(false)
+	if conn != nil {
+		deadline := time.Now().Add(250 * time.Millisecond)
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+		r.sleepWithContext(100 * time.Millisecond)
+		_ = conn.Close()
+	}
 
-	// Wait for the connection to close
-	time.Sleep(100 * time.Millisecond)
+	if r.sleepWithContext(100 * time.Millisecond) {
+		return
+	}
 
 	// Increment reconnect attempts for this reconnection
 	r.incrementReconnectAttempts()
@@ -415,7 +430,9 @@ func (r *Resws) CloseAndReconnect() {
 		if r.onReconnectingFn != nil {
 			r.emitEvent(Event{Type: EventReconnecting, Data: backoffDuration})
 		}
-		time.Sleep(backoffDuration)
+		if r.sleepWithContext(backoffDuration) {
+			return
+		}
 	}
 
 	go r.connect()
@@ -729,12 +746,12 @@ func (r *Resws) processMessageQueue(ctx context.Context) {
 			r.messageQueueMu.Unlock()
 
 			// Try to send the message
-			r.mu.RLock()
+			r.mu.Lock()
 			if r.WriteDeadline > time.Duration(0) {
 				conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
 			}
-			r.mu.RUnlock()
 			err := conn.WriteMessage(websocket.TextMessage, msg)
+			r.mu.Unlock()
 			if err != nil {
 				r.Logger.Error("[%s] Failed to send queued message, stopping queue processor: %v", r.url, err)
 				r.messageQueueMu.Lock()
@@ -804,7 +821,13 @@ func (r *Resws) ReadMessage() (msgType int, msg []byte, err error) {
 	if !r.IsConnected() {
 		return
 	}
-	msgType, msg, err = r.Conn.ReadMessage()
+	r.mu.RLock()
+	conn := r.Conn
+	r.mu.RUnlock()
+	if conn == nil {
+		return
+	}
+	msgType, msg, err = conn.ReadMessage()
 	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 		r.Close()
 		return msgType, msg, nil
@@ -827,7 +850,13 @@ func (r *Resws) ReadJSON(v any) (err error) {
 	if !r.IsConnected() {
 		return
 	}
-	err = r.Conn.ReadJSON(v)
+	r.mu.RLock()
+	conn := r.Conn
+	r.mu.RUnlock()
+	if conn == nil {
+		return
+	}
+	err = conn.ReadJSON(v)
 	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 		r.Close()
 		return
