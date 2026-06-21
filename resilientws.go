@@ -104,12 +104,15 @@ type Resws struct {
 	dialer          *websocket.Dialer
 	httpResp        *http.Response
 	mu              sync.RWMutex
+	writeMu         sync.Mutex
 	messageQueue    [][]byte
 	messageQueueMu  sync.Mutex
 	isConnected     bool
 	lastConnect     time.Time
 	lastErr         error
 	shouldReconnect bool
+	active          bool
+	reconnecting    bool
 	connectedCh     chan struct{}
 	connOnce        *sync.Once
 	closeOnce       sync.Once
@@ -208,6 +211,9 @@ func (r *Resws) setDefaultConfig() {
 	if r.PingInterval == 0 {
 		r.PingInterval = 15 * time.Second
 	}
+	if r.MessageQueueSize == 0 {
+		r.MessageQueueSize = 100
+	}
 	r.dialer = &websocket.Dialer{
 		TLSClientConfig:  r.TLSConfig,
 		Proxy:            r.Proxy,
@@ -249,18 +255,25 @@ func (r *Resws) parseURL(urlStr string) (string, error) {
 
 // emitEvent emits an event to the event handlers
 func (r *Resws) emitEvent(event Event) {
+	r.mu.RLock()
+	onConnectedFn := r.onConnectedFn
+	onReconnectingFn := r.onReconnectingFn
+	onErrorFn := r.onErrorFn
+	url := r.url
+	r.mu.RUnlock()
+
 	switch event.Type {
 	case EventConnected:
-		if r.onConnectedFn != nil {
-			r.onConnectedFn(r.url)
+		if onConnectedFn != nil {
+			onConnectedFn(url)
 		}
 	case EventReconnecting:
-		if r.onReconnectingFn != nil {
-			r.onReconnectingFn(event.Data.(time.Duration))
+		if onReconnectingFn != nil {
+			onReconnectingFn(event.Data.(time.Duration))
 		}
 	case EventError:
-		if r.onErrorFn != nil {
-			r.onErrorFn(event.Error)
+		if onErrorFn != nil {
+			onErrorFn(event.Error)
 		}
 	}
 }
@@ -345,15 +358,68 @@ func (r *Resws) GetHTTPResponse() *http.Response {
 // sleepWithContext sleeps for d, but returns early if r.ctx is cancelled.
 // Returns true if cancelled, false if the full duration elapsed.
 func (r *Resws) sleepWithContext(d time.Duration) bool {
-	if r.ctx == nil {
+	r.mu.RLock()
+	ctx := r.ctx
+	r.mu.RUnlock()
+
+	if ctx == nil {
 		time.Sleep(d)
 		return false
 	}
 	select {
-	case <-r.ctx.Done():
+	case <-ctx.Done():
 		return true
 	case <-time.After(d):
 		return false
+	}
+}
+
+func (r *Resws) doWrite(conn *websocket.Conn, msgType int, data []byte) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
+	r.mu.RLock()
+	deadline := r.WriteDeadline
+	r.mu.RUnlock()
+
+	if deadline > 0 {
+		_ = conn.SetWriteDeadline(time.Now().Add(deadline))
+	}
+	return conn.WriteMessage(msgType, data)
+}
+
+func (r *Resws) doWriteControl(conn *websocket.Conn, msgType int, data []byte) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
+	r.mu.RLock()
+	pingInterval := r.PingInterval
+	r.mu.RUnlock()
+
+	return conn.WriteControl(msgType, data, time.Now().Add(pingInterval))
+}
+
+func (r *Resws) doWriteCloseFrame(conn *websocket.Conn) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
+	deadline := time.Now().Add(250 * time.Millisecond)
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+}
+
+func (r *Resws) waitGoroutines(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		r.connWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		if r.Logger != nil {
+			r.Logger.Error("goroutine cleanup timed out after %v", timeout)
+		}
 	}
 }
 
@@ -363,11 +429,14 @@ func (r *Resws) Close() {
 		// Prevent any future reconnect attempts
 		r.mu.Lock()
 		r.shouldReconnect = false
+		r.active = false
+		r.reconnecting = false
 		conn := r.Conn
 		r.Conn = nil
 		connCancel := r.connCancel
 		r.connCancel = nil
 		cancel := r.cancel
+		r.cancel = nil
 		r.mu.Unlock()
 
 		if cancel != nil {
@@ -380,13 +449,12 @@ func (r *Resws) Close() {
 
 		if conn != nil {
 			// Attempt graceful close
-			deadline := time.Now().Add(250 * time.Millisecond)
-			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+			r.doWriteCloseFrame(conn)
 			time.Sleep(100 * time.Millisecond)
 			_ = conn.Close()
 		}
 
-		r.connWg.Wait()
+		r.waitGoroutines(10 * time.Second)
 
 		r.setIsConnected(false)
 		r.emitEvent(Event{Type: EventClose})
@@ -396,6 +464,11 @@ func (r *Resws) Close() {
 // CloseAndReconnect closes the connection and starts a reconnection attempt with backoff
 func (r *Resws) CloseAndReconnect() {
 	r.mu.Lock()
+	if r.reconnecting || !r.shouldReconnect {
+		r.mu.Unlock()
+		return
+	}
+	r.reconnecting = true
 	conn := r.Conn
 	r.Conn = nil
 	r.isConnected = false
@@ -408,13 +481,15 @@ func (r *Resws) CloseAndReconnect() {
 	r.mu.Unlock()
 
 	if conn != nil {
-		deadline := time.Now().Add(250 * time.Millisecond)
-		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+		r.doWriteCloseFrame(conn)
 		r.sleepWithContext(100 * time.Millisecond)
 		_ = conn.Close()
 	}
 
 	if r.sleepWithContext(100 * time.Millisecond) {
+		r.mu.Lock()
+		r.reconnecting = false
+		r.mu.Unlock()
 		return
 	}
 
@@ -427,10 +502,11 @@ func (r *Resws) CloseAndReconnect() {
 		if !r.NonVerbose {
 			r.Logger.Info("Will reconnect in %v (attempt %d)", backoffDuration, r.getReconnectAttempts())
 		}
-		if r.onReconnectingFn != nil {
-			r.emitEvent(Event{Type: EventReconnecting, Data: backoffDuration})
-		}
+		r.emitEvent(Event{Type: EventReconnecting, Data: backoffDuration})
 		if r.sleepWithContext(backoffDuration) {
+			r.mu.Lock()
+			r.reconnecting = false
+			r.mu.Unlock()
 			return
 		}
 	}
@@ -448,11 +524,21 @@ func (r *Resws) getHandshakeTimeout() time.Duration {
 
 // Dial establishes a connection to the WebSocket server
 func (r *Resws) Dial(url string) {
+	r.mu.Lock()
+	if r.active {
+		r.mu.Unlock()
+		return
+	}
+	r.active = true
 	r.ctx, r.cancel = context.WithCancel(context.Background())
+	r.mu.Unlock()
 
 	urlStr, err := r.parseURL(url)
 	if err != nil {
+		r.mu.Lock()
+		r.active = false
 		r.lastErr = err
+		r.mu.Unlock()
 		r.emitEvent(Event{Type: EventError, Error: err})
 		return
 	}
@@ -491,7 +577,7 @@ func (r *Resws) connect() {
 	}
 	r.mu.Unlock()
 
-	r.connWg.Wait()
+	r.waitGoroutines(10 * time.Second)
 
 	r.mu.Lock()
 	r.connCtx, r.connCancel = context.WithCancel(r.ctx)
@@ -519,6 +605,7 @@ func (r *Resws) connect() {
 			r.mu.Lock()
 			r.Conn = conn
 			r.lastConnect = time.Now()
+			r.reconnecting = false
 			r.mu.Unlock()
 
 			if !r.NonVerbose {
@@ -582,17 +669,13 @@ func (r *Resws) handleDialFailure(resp *http.Response, err error, backoff time.D
 
 	r.setIsConnected(false)
 
-	if r.onErrorFn != nil {
-		r.emitEvent(Event{Type: EventError, Error: err})
-	}
+	r.emitEvent(Event{Type: EventError, Error: err})
 	if !r.NonVerbose {
 		r.Logger.Info("Will reconnect in %v", backoff)
 	}
-	if r.onReconnectingFn != nil {
-		r.emitEvent(Event{Type: EventReconnecting, Data: backoff})
-	}
+	r.emitEvent(Event{Type: EventReconnecting, Data: backoff})
 
-	time.Sleep(backoff)
+	r.sleepWithContext(backoff)
 }
 
 func (r *Resws) retrySubscribeHandler() error {
@@ -647,13 +730,7 @@ func (r *Resws) Send(msg []byte) error {
 
 	// If we have a connection, try to send directly
 	if conn != nil {
-		if r.WriteDeadline > time.Duration(0) {
-			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
-		}
-		r.mu.Lock()
-		err := conn.WriteMessage(websocket.TextMessage, msg)
-		r.mu.Unlock()
-		if err == nil {
+		if err := r.doWrite(conn, websocket.TextMessage, msg); err == nil {
 			return nil
 		}
 	}
@@ -675,42 +752,11 @@ func (r *Resws) Send(msg []byte) error {
 }
 
 func (r *Resws) SendJSON(v any) (err error) {
-	r.mu.RLock()
-	conn := r.Conn
-	r.mu.RUnlock()
-
-	// If we have a connection, try to send directly
-	if conn != nil {
-		if r.WriteDeadline > time.Duration(0) {
-			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
-		}
-		r.mu.Lock()
-		err = conn.WriteJSON(v)
-		r.mu.Unlock()
-		if err == nil {
-			return nil
-		}
-	}
-
-	// If no connection or send failed, queue the message
-	r.messageQueueMu.Lock()
-	if len(r.messageQueue) >= r.MessageQueueSize {
-		r.messageQueueMu.Unlock()
-		return fmt.Errorf("message queue is full")
-	}
 	b, err := json.Marshal(v)
 	if err != nil {
-		r.messageQueueMu.Unlock()
 		return err
 	}
-	r.messageQueue = append(r.messageQueue, b)
-	r.messageQueueMu.Unlock()
-
-	if r.Logger == nil {
-		r.Logger = &defaultLogger{}
-	}
-	r.Logger.Debug("Message queued for later delivery")
-	return nil
+	return r.Send(b)
 }
 
 // processMessageQueue processes messages from the queue and sends them to the WebSocket server
@@ -746,22 +792,15 @@ func (r *Resws) processMessageQueue(ctx context.Context) {
 			r.messageQueueMu.Unlock()
 
 			// Try to send the message
-			r.mu.Lock()
-			if r.WriteDeadline > time.Duration(0) {
-				conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
-			}
-			err := conn.WriteMessage(websocket.TextMessage, msg)
-			r.mu.Unlock()
-			if err != nil {
+			if err := r.doWrite(conn, websocket.TextMessage, msg); err != nil {
 				r.Logger.Error("[%s] Failed to send queued message, stopping queue processor: %v", r.url, err)
 				r.messageQueueMu.Lock()
 				if len(r.messageQueue) < r.MessageQueueSize {
-					r.messageQueue = append(r.messageQueue, msg)
+					r.messageQueue = append([][]byte{msg}, r.messageQueue...)
 				} else {
 					r.Logger.Error("[%s] Failed to requeue message: queue full", r.url)
 				}
 				r.messageQueueMu.Unlock()
-				return
 			} else {
 				r.Logger.Debug("Successfully sent queued message")
 			}
@@ -783,8 +822,9 @@ func (r *Resws) reader(ctx context.Context) {
 			if conn == nil {
 				return
 			}
-			if r.ReadDeadline > time.Duration(0) {
-				conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
+			pingHandlerSet := r.PingHandler != nil
+			if r.ReadDeadline > time.Duration(0) && !pingHandlerSet {
+				_ = conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
 			}
 			msgType, msg, err := conn.ReadMessage()
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.ClosePolicyViolation) {
@@ -876,12 +916,13 @@ func (r *Resws) ReadJSON(v any) (err error) {
 // WriteMessage manually writes a message to the websocket connection
 func (r *Resws) WriteMessage(msgType int, msg []byte) (err error) {
 	err = errNotConnected
-	if !r.IsConnected() {
+	r.mu.RLock()
+	conn := r.Conn
+	r.mu.RUnlock()
+	if conn == nil {
 		return
 	}
-	r.mu.Lock()
-	err = r.Conn.WriteMessage(msgType, msg)
-	r.mu.Unlock()
+	err = r.doWrite(conn, msgType, msg)
 	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 		r.Close()
 		return
@@ -892,19 +933,11 @@ func (r *Resws) WriteMessage(msgType int, msg []byte) (err error) {
 
 // WriteJSON manually writes a JSON message to the websocket connection
 func (r *Resws) WriteJSON(v any) (err error) {
-	err = errNotConnected
-	if !r.IsConnected() {
-		return
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
 	}
-	r.mu.Lock()
-	err = r.Conn.WriteJSON(v)
-	r.mu.Unlock()
-	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
-		r.Close()
-		return
-	}
-
-	return
+	return r.WriteMessage(websocket.TextMessage, b)
 }
 
 // heartbeat sends ping messages to the server to keep the connection alive
@@ -937,7 +970,7 @@ func (r *Resws) heartbeat(ctx context.Context) {
 				return
 			}
 
-			if err := currentConn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(r.PingInterval)); err != nil {
+			if err := r.doWriteControl(currentConn, websocket.PingMessage, []byte{}); err != nil {
 				return
 			}
 			r.PingHandler()
