@@ -685,6 +685,279 @@ func TestQueueProcessorNoInfiniteLoop(t *testing.T) {
 	assert.False(t, ws.IsConnected(), "Should be disconnected")
 }
 
+func TestConcurrentSendAndQueueDrain(t *testing.T) {
+	received := make(chan []byte, 200)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			select {
+			case received <- msg:
+			default:
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		MessageQueueSize: 200,
+	}
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				_ = ws.Send([]byte("concurrent message"))
+			}
+		}()
+	}
+	wg.Wait()
+
+	count := 0
+	timeout := time.After(1 * time.Second)
+	for count < 100 {
+		select {
+		case msg := <-received:
+			assert.Equal(t, []byte("concurrent message"), msg, "Message corrupted")
+			count++
+		case <-timeout:
+			t.Fatalf("expected 100 messages, got %d", count)
+		}
+	}
+	assert.Equal(t, 100, count, "Should have received all messages")
+}
+
+func TestCloseDoesNotBlockDuringBackoffSleep(t *testing.T) {
+	connCount := int32(0)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		count := atomic.AddInt32(&connCount, 1)
+		if count <= 2 {
+			time.Sleep(50 * time.Millisecond)
+			conn.Close()
+			return
+		}
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		RecBackoffMin:  10 * time.Second,
+		RecBackoffMax:  30 * time.Second,
+		MessageHandler: func(_ int, msg []byte) {},
+	}
+
+	ws.Dial(wsURLFromHTTP(ts.URL))
+
+	time.Sleep(1500 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		ws.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() blocked for >2s during backoff sleep")
+	}
+}
+
+func TestReadMessageNoRaceWithConcurrentClose(t *testing.T) {
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			err := conn.WriteMessage(websocket.TextMessage, []byte("data"))
+			if err != nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	time.Sleep(50 * time.Millisecond)
+
+	panicked := atomic.Bool{}
+
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked.Store(true)
+			}
+			close(done)
+		}()
+		for {
+			_, _, err := ws.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	ws.Close()
+	<-done
+
+	assert.False(t, panicked.Load(), "ReadMessage should not panic on concurrent Close")
+}
+
+func TestCloseAndReconnectDoesNotBlockIsConnected(t *testing.T) {
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		RecBackoffMin:  50 * time.Millisecond,
+		RecBackoffMax:  200 * time.Millisecond,
+		MessageHandler: func(_ int, msg []byte) {},
+	}
+
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	time.Sleep(100 * time.Millisecond)
+
+	go func() {
+		ws.CloseAndReconnect()
+	}()
+	time.Sleep(5 * time.Millisecond)
+
+	maxBlock := time.Duration(0)
+	for i := 0; i < 20; i++ {
+		start := time.Now()
+		ws.IsConnected()
+		elapsed := time.Since(start)
+		if elapsed > maxBlock {
+			maxBlock = elapsed
+		}
+	}
+
+	assert.Less(t, maxBlock, 50*time.Millisecond, "IsConnected() blocked too long: %v", maxBlock)
+
+	time.Sleep(500 * time.Millisecond)
+	ws.Close()
+}
+
+func TestDialWhileActiveDoesNotCreateDuplicateConnections(t *testing.T) {
+	connCount := int32(0)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		atomic.AddInt32(&connCount, 1)
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{}
+	url := wsURLFromHTTP(ts.URL)
+	ws.Dial(url)
+	ws.Dial(url)
+	defer ws.Close()
+
+	time.Sleep(200 * time.Millisecond)
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&connCount), "second Dial while active should be ignored")
+}
+
+func TestCloseAndReconnectConcurrentCallsSingleFlight(t *testing.T) {
+	connCount := int32(0)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		atomic.AddInt32(&connCount, 1)
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		RecBackoffMin:  10 * time.Millisecond,
+		RecBackoffMax:  50 * time.Millisecond,
+		MessageHandler: func(_ int, msg []byte) {},
+	}
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ws.CloseAndReconnect()
+		}()
+	}
+	wg.Wait()
+
+	assert.Eventually(t, func() bool {
+		return atomic.LoadInt32(&connCount) == 2
+	}, 2*time.Second, 20*time.Millisecond, "concurrent reconnect calls should produce one replacement connection")
+	assert.Equal(t, int32(2), atomic.LoadInt32(&connCount), "concurrent reconnect calls should not create duplicate replacement connections")
+}
+
+func TestQueuedMessageOrderPreservedAfterOfflineReconnect(t *testing.T) {
+	received := make(chan string, 3)
+	ts := newMockWSServer(func(conn *websocket.Conn, w http.ResponseWriter) {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			received <- string(msg)
+		}
+	})
+	defer ts.Close()
+
+	ws := &resilientws.Resws{
+		MessageQueueSize: 3,
+		RecBackoffMin:    10 * time.Millisecond,
+		RecBackoffMax:    50 * time.Millisecond,
+	}
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	ws.Close()
+
+	_ = ws.Send([]byte("first"))
+	_ = ws.Send([]byte("second"))
+	_ = ws.Send([]byte("third"))
+
+	ws.Dial(wsURLFromHTTP(ts.URL))
+	defer ws.Close()
+
+	for _, want := range []string{"first", "second", "third"} {
+		select {
+		case got := <-received:
+			assert.Equal(t, want, got)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for %q", want)
+		}
+	}
+}
+
 func TestWebSocketws(t *testing.T) {
 	t.Run("PingHandler", TestPingHandler)
 
@@ -711,4 +984,18 @@ func TestWebSocketws(t *testing.T) {
 	t.Run("SubscribeHandlerContextCancellation", TestSubscribeHandlerContextCancellation)
 
 	t.Run("GoroutineLifecycleManagement", TestGoroutineLifecycleManagement)
+
+	t.Run("ConcurrentSendAndQueueDrain", TestConcurrentSendAndQueueDrain)
+
+	t.Run("CloseDoesNotBlockDuringBackoffSleep", TestCloseDoesNotBlockDuringBackoffSleep)
+
+	t.Run("ReadMessageNoRaceWithConcurrentClose", TestReadMessageNoRaceWithConcurrentClose)
+
+	t.Run("CloseAndReconnectDoesNotBlockIsConnected", TestCloseAndReconnectDoesNotBlockIsConnected)
+
+	t.Run("DialWhileActiveDoesNotCreateDuplicateConnections", TestDialWhileActiveDoesNotCreateDuplicateConnections)
+
+	t.Run("CloseAndReconnectConcurrentCallsSingleFlight", TestCloseAndReconnectConcurrentCallsSingleFlight)
+
+	t.Run("QueuedMessageOrderPreservedAfterOfflineReconnect", TestQueuedMessageOrderPreservedAfterOfflineReconnect)
 }
