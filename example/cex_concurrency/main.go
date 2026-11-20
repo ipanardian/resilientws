@@ -139,12 +139,14 @@ func runExchange(ctx context.Context, cfg exchangeConfig, forceReconnect bool, d
 			return
 		}
 
-		if reply := cfg.pongReply(msg); reply != nil {
-			stats.pongs.Add(1)
-			if err := ws.Send(reply); err != nil {
-				stats.errors.Add(1)
+		if cfg.pongReply != nil {
+			if reply := cfg.pongReply(msg); reply != nil {
+				stats.pongs.Add(1)
+				if err := ws.Send(reply); err != nil {
+					stats.errors.Add(1)
+				}
+				return
 			}
-			return
 		}
 
 		stats.messages.Add(1)
