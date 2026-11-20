@@ -119,8 +119,6 @@ type Resws struct {
 	lastReconnectTime time.Time
 	backoffMu         sync.RWMutex
 
-	workers *sync.WaitGroup
-
 	// Event handlers
 	onReconnectingFn func(time.Duration)
 	onConnectedFn    func(string)
@@ -312,18 +310,15 @@ func (r *Resws) GetHTTPResponse() *http.Response {
 	return r.httpResp
 }
 
-// Close stops reconnecting and closes the current socket.
+// Close stops reconnecting and closes the current socket. It can be called
+// from a callback and does not wait for callbacks already running.
 func (r *Resws) Close() {
 	r.mu.Lock()
 	if r.session != nil {
 		r.session.cancel()
 	}
-	workers := r.workers
 	r.detachSocketLocked()
 	r.mu.Unlock()
-	if workers != nil {
-		workers.Wait()
-	}
 }
 
 // detachSocketLocked closes the owned socket before the next handshake can start.
@@ -458,15 +453,13 @@ func (r *Resws) connect(s *dialSession, target string, dialer websocket.Dialer) 
 		r.lastConnect = time.Now()
 		r.isConnected = true
 
-		workers := new(sync.WaitGroup)
-		r.workers = workers
-		startWorker(workers, func() { r.monitorConnectionStability(connCtx) })
-		startWorker(workers, func() { r.processMessageQueue(connCtx, conn, target) })
+		go r.monitorConnectionStability(connCtx)
+		go r.processMessageQueue(connCtx, conn, target)
 		if r.PingHandler != nil {
-			startWorker(workers, func() { r.heartbeat(connCtx, conn) })
+			go r.heartbeat(connCtx, conn)
 		}
 		if r.MessageHandler != nil {
-			startWorker(workers, func() { r.reader(connCtx, conn) })
+			go r.reader(connCtx, conn)
 		}
 		if ready != nil {
 			close(ready)
@@ -505,14 +498,6 @@ func (r *Resws) connect(s *dialSession, target string, dialer websocket.Dialer) 
 		}
 		nextDelay, attempt = r.RecBackoffMin, 0
 	}
-}
-
-func startWorker(workers *sync.WaitGroup, run func()) {
-	workers.Add(1)
-	go func() {
-		defer workers.Done()
-		run()
-	}()
 }
 
 func (r *Resws) waitReconnect(ctx context.Context, delay time.Duration) bool {

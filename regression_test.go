@@ -222,3 +222,48 @@ func TestReconnectWithOneProviderSlot(t *testing.T) {
 		t.Fatalf("got %d total attempts, want 3", n)
 	}
 }
+
+func TestCloseFromConnectionCallback(t *testing.T) {
+	for _, kind := range []string{"message", "ping"} {
+		t.Run(kind, func(t *testing.T) {
+			var attempts atomic.Int32
+			serverClosed := make(chan struct{}, 1)
+			url := localSocket(t, func(conn *websocket.Conn) {
+				if attempts.Add(1) != 1 {
+					t.Error("unexpected replacement after Close")
+				}
+				if kind == "message" {
+					if err := conn.WriteMessage(websocket.TextMessage, []byte("update")); err != nil {
+						t.Error(err)
+						return
+					}
+				}
+				_, _, err := conn.ReadMessage()
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+					t.Errorf("expected normal close, got %v", err)
+				}
+				serverClosed <- struct{}{}
+			})
+
+			returned := make(chan struct{}, 1)
+			ws := &Resws{PingInterval: 10 * time.Millisecond}
+			closeFromCallback := func() {
+				ws.Close()
+				returned <- struct{}{}
+			}
+			switch kind {
+			case "message":
+				ws.MessageHandler = func(int, []byte) { closeFromCallback() }
+			case "ping":
+				ws.PingHandler = closeFromCallback
+			}
+			ws.Dial(url)
+			receive(t, returned, "Close returning from "+kind+" callback")
+			receive(t, serverClosed, "provider observing close frame")
+			if ws.IsConnected() {
+				t.Fatal("connected after Close returned")
+			}
+			ws.Close()
+		})
+	}
+}
