@@ -55,6 +55,18 @@ defer ws.Close()
 
 Check the example directory for more detailed usage examples.
 
+### Reconnecting with a single connection slot
+
+A `Resws` instance closes its old socket before opening a replacement and
+runs at most one handshake at a time. `CloseAndReconnect()` schedules a
+replacement; requests while the client is already reconnecting do not start
+more handshakes. If the provider has not freed the old slot yet and rejects
+the next handshake, the client retries with backoff.
+
+Call `Close()` before using `Dial()` to switch the instance to a different
+endpoint. If several instances share a provider connection quota, coordinate
+that quota in the application.
+
 ## License
 
 [resilientws](https://github.com/ipanardian/resilientws) is licensed under the [MIT License](https://opensource.org/licenses/MIT).
