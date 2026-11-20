@@ -104,6 +104,7 @@ type Resws struct {
 	dialer          *websocket.Dialer
 	httpResp        *http.Response
 	mu              sync.RWMutex
+	writeMu         sync.Mutex
 	messageQueue    [][]byte
 	messageQueueMu  sync.Mutex
 	isConnected     bool
@@ -622,6 +623,18 @@ func (r *Resws) retrySubscribeHandler() error {
 	}
 }
 
+// write serializes Gorilla's data writes and deadline updates.
+func (r *Resws) write(conn *websocket.Conn, fn func() error) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	if r.WriteDeadline > 0 {
+		if err := conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline)); err != nil {
+			return err
+		}
+	}
+	return fn()
+}
+
 // Send sends a message to the WebSocket server with a fallback queue
 func (r *Resws) Send(msg []byte) error {
 	r.mu.RLock()
@@ -630,12 +643,7 @@ func (r *Resws) Send(msg []byte) error {
 
 	// If we have a connection, try to send directly
 	if conn != nil {
-		if r.WriteDeadline > time.Duration(0) {
-			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
-		}
-		r.mu.Lock()
-		err := conn.WriteMessage(websocket.TextMessage, msg)
-		r.mu.Unlock()
+		err := r.write(conn, func() error { return conn.WriteMessage(websocket.TextMessage, msg) })
 		if err == nil {
 			return nil
 		}
@@ -664,12 +672,7 @@ func (r *Resws) SendJSON(v any) (err error) {
 
 	// If we have a connection, try to send directly
 	if conn != nil {
-		if r.WriteDeadline > time.Duration(0) {
-			conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
-		}
-		r.mu.Lock()
-		err = conn.WriteJSON(v)
-		r.mu.Unlock()
+		err = r.write(conn, func() error { return conn.WriteJSON(v) })
 		if err == nil {
 			return nil
 		}
@@ -729,12 +732,7 @@ func (r *Resws) processMessageQueue(ctx context.Context) {
 			r.messageQueueMu.Unlock()
 
 			// Try to send the message
-			r.mu.RLock()
-			if r.WriteDeadline > time.Duration(0) {
-				conn.SetWriteDeadline(time.Now().Add(r.WriteDeadline))
-			}
-			r.mu.RUnlock()
-			err := conn.WriteMessage(websocket.TextMessage, msg)
+			err := r.write(conn, func() error { return conn.WriteMessage(websocket.TextMessage, msg) })
 			if err != nil {
 				r.Logger.Error("[%s] Failed to send queued message, stopping queue processor: %v", r.url, err)
 				r.messageQueueMu.Lock()
@@ -846,13 +844,13 @@ func (r *Resws) ReadJSON(v any) (err error) {
 
 // WriteMessage manually writes a message to the websocket connection
 func (r *Resws) WriteMessage(msgType int, msg []byte) (err error) {
-	err = errNotConnected
-	if !r.IsConnected() {
-		return
+	r.mu.RLock()
+	conn := r.Conn
+	r.mu.RUnlock()
+	if conn == nil {
+		return errNotConnected
 	}
-	r.mu.Lock()
-	err = r.Conn.WriteMessage(msgType, msg)
-	r.mu.Unlock()
+	err = r.write(conn, func() error { return conn.WriteMessage(msgType, msg) })
 	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 		r.Close()
 		return
@@ -863,13 +861,13 @@ func (r *Resws) WriteMessage(msgType int, msg []byte) (err error) {
 
 // WriteJSON manually writes a JSON message to the websocket connection
 func (r *Resws) WriteJSON(v any) (err error) {
-	err = errNotConnected
-	if !r.IsConnected() {
-		return
+	r.mu.RLock()
+	conn := r.Conn
+	r.mu.RUnlock()
+	if conn == nil {
+		return errNotConnected
 	}
-	r.mu.Lock()
-	err = r.Conn.WriteJSON(v)
-	r.mu.Unlock()
+	err = r.write(conn, func() error { return conn.WriteJSON(v) })
 	if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 		r.Close()
 		return
