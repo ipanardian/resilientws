@@ -267,3 +267,61 @@ func TestCloseFromConnectionCallback(t *testing.T) {
 		})
 	}
 }
+
+func TestQueuedWriteFailureReconnectsAndRetainsOrder(t *testing.T) {
+	var handshakes atomic.Int32
+	received := make(chan string, 2)
+	url := localSocket(t, func(conn *websocket.Conn) {
+		if handshakes.Add(1) == 1 {
+			drainSocket(conn)
+			return
+		}
+		for i := 0; i < 2; i++ {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				t.Errorf("read replayed frame: %v", err)
+				return
+			}
+			received <- string(msg)
+		}
+		drainSocket(conn)
+	})
+
+	ws := &Resws{MessageQueueSize: 2, WriteDeadline: time.Second}
+	setup := make(chan error, 1)
+	var connected atomic.Int32
+	ws.OnConnected(func(string) {
+		if connected.Add(1) != 1 {
+			return
+		}
+
+		// A sent close frame makes Gorilla reject all subsequent data writes.
+		// Leave reconnect detection to the queue worker (no reader or heartbeat).
+		ws.mu.RLock()
+		conn := ws.Conn
+		ws.mu.RUnlock()
+		err := conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(1000, ""),
+			time.Now().Add(time.Second))
+		if err == nil {
+			err = ws.Send([]byte("first"))
+		}
+		if err == nil {
+			err = ws.Send([]byte("second"))
+		}
+		setup <- err
+	})
+	ws.Dial(url)
+	defer ws.Close()
+
+	if err := receive(t, setup, "messages queued on the failed socket"); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"first", "second"} {
+		if got := receive(t, received, "replayed message"); got != want {
+			t.Fatalf("replayed message = %q, want %q", got, want)
+		}
+	}
+	if n := handshakes.Load(); n != 2 {
+		t.Fatalf("got %d handshakes, want original and one replacement", n)
+	}
+}

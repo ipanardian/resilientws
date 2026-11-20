@@ -106,6 +106,7 @@ type Resws struct {
 	writeMu        sync.Mutex
 	messageQueue   [][]byte
 	messageQueueMu sync.Mutex
+	queueDrainMu   sync.Mutex
 	isConnected    bool
 	lastConnect    time.Time
 	lastErr        error
@@ -655,37 +656,40 @@ func (r *Resws) processMessageQueue(ctx context.Context, conn *websocket.Conn, t
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-
-			r.messageQueueMu.Lock()
-			queueLen := len(r.messageQueue)
-			if queueLen == 0 {
-				r.messageQueueMu.Unlock()
-				continue
-			}
-
-			// Get the first message
-			msg := r.messageQueue[0]
-			// Remove it from the queue
-			r.messageQueue = r.messageQueue[1:]
-			r.messageQueueMu.Unlock()
-
-			// Try to send the message
-			err := r.write(conn, func() error { return conn.WriteMessage(websocket.TextMessage, msg) })
-			if err != nil {
-				r.Logger.Error("[%s] Failed to send queued message, stopping queue processor: %v", target, err)
-				r.messageQueueMu.Lock()
-				if len(r.messageQueue) < r.MessageQueueSize {
-					r.messageQueue = append(r.messageQueue, msg)
-				} else {
-					r.Logger.Error("[%s] Failed to requeue message: queue full", target)
-				}
-				r.messageQueueMu.Unlock()
+			if err := r.flushQueueHead(ctx, conn); err != nil {
+				r.requestReconnect(conn)
+				r.Logger.Error("[%s] Failed to send queued message; retaining for reconnect: %v", target, err)
 				return
-			} else {
-				r.Logger.Debug("Successfully sent queued message")
 			}
 		}
 	}
+}
+
+// Keep the head in the queue until it is written. During a reconnect only
+// one worker can advance it, even if the old worker is finishing a write.
+func (r *Resws) flushQueueHead(ctx context.Context, conn *websocket.Conn) error {
+	r.queueDrainMu.Lock()
+	defer r.queueDrainMu.Unlock()
+	if ctx.Err() != nil {
+		return nil
+	}
+
+	r.messageQueueMu.Lock()
+	if len(r.messageQueue) == 0 {
+		r.messageQueueMu.Unlock()
+		return nil
+	}
+	msg := r.messageQueue[0]
+	r.messageQueueMu.Unlock()
+
+	if err := r.write(conn, func() error { return conn.WriteMessage(websocket.TextMessage, msg) }); err != nil {
+		return err
+	}
+	r.messageQueueMu.Lock()
+	r.messageQueue[0] = nil
+	r.messageQueue = r.messageQueue[1:]
+	r.messageQueueMu.Unlock()
+	return nil
 }
 
 // reader loops and reads messages from the WebSocket connection and emits them as events
