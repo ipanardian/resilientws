@@ -204,7 +204,9 @@ func (r *Resws) setDefaultConfig() {
 	if r.PingInterval == 0 {
 		r.PingInterval = 15 * time.Second
 	}
-
+	if r.MessageQueueSize == 0 {
+		r.MessageQueueSize = 100
+	}
 }
 
 // parseURL parses the URL of the WebSocket server
@@ -454,6 +456,12 @@ func (r *Resws) connect(s *dialSession, target string, dialer websocket.Dialer) 
 		r.lastConnect = time.Now()
 		r.isConnected = true
 
+		if r.PingHandler != nil && r.PongTimeout > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
+			conn.SetPongHandler(func(string) error {
+				return conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
+			})
+		}
 		go r.monitorConnectionStability(connCtx)
 		go r.processMessageQueue(connCtx, conn, target)
 		if r.PingHandler != nil {
@@ -699,8 +707,8 @@ func (r *Resws) reader(ctx context.Context, conn *websocket.Conn) {
 		case <-ctx.Done():
 			return
 		default:
-			if r.ReadDeadline > time.Duration(0) {
-				conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
+			if r.ReadDeadline > 0 && r.PingHandler == nil {
+				_ = conn.SetReadDeadline(time.Now().Add(r.ReadDeadline))
 			}
 			msgType, msg, err := conn.ReadMessage()
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.ClosePolicyViolation) {
@@ -806,14 +814,6 @@ func (r *Resws) WriteJSON(v any) (err error) {
 func (r *Resws) heartbeat(ctx context.Context, conn *websocket.Conn) {
 	ticker := time.NewTicker(r.PingInterval)
 	defer ticker.Stop()
-
-	if conn != nil && r.PongTimeout > 0 {
-		_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
-		conn.SetPongHandler(func(appData string) error {
-			_ = conn.SetReadDeadline(time.Now().Add(r.PongTimeout))
-			return nil
-		})
-	}
 
 	for {
 		select {

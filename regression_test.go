@@ -325,3 +325,46 @@ func TestQueuedWriteFailureReconnectsAndRetainsOrder(t *testing.T) {
 		t.Fatalf("got %d handshakes, want original and one replacement", n)
 	}
 }
+
+func TestPongHandlerInitializedBeforeReader(t *testing.T) {
+	received := make(chan struct{}, 1)
+	url := localSocket(t, func(conn *websocket.Conn) {
+		for i := 0; i < 32; i++ {
+			if err := conn.WriteControl(websocket.PongMessage, nil, time.Now().Add(time.Second)); err != nil {
+				return
+			}
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, []byte("ready")); err != nil {
+			return
+		}
+		drainSocket(conn)
+	})
+	ws := &Resws{
+		PingHandler: func() {},
+		PongTimeout: time.Second,
+		MessageHandler: func(int, []byte) {
+			select {
+			case received <- struct{}{}:
+			default:
+			}
+		},
+	}
+	ws.Dial(url)
+	defer ws.Close()
+	receive(t, received, "message after pong frames")
+}
+
+func TestDefaultQueueSizeFromMain(t *testing.T) {
+	url := localSocket(t, drainSocket)
+	ws := &Resws{}
+	ws.Dial(url)
+	ws.Close()
+	for i := 0; i < 100; i++ {
+		if err := ws.Send([]byte("offline")); err != nil {
+			t.Fatalf("message %d: %v", i, err)
+		}
+	}
+	if err := ws.Send([]byte("overflow")); err == nil {
+		t.Fatal("expected queue full after 100 messages")
+	}
+}
